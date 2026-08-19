@@ -27,12 +27,19 @@ urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
 requires-python = ">=3.11"
 dependencies = [
     "opteryx-catalog>=0.4.99",
-    "pyiceberg>=0.11,<1",
+    # IcebergFileIO (fileio.py) wraps pyiceberg's PyArrowFileIO unconditionally,
+    # so pyarrow is a hard runtime dependency here, not optional - pyiceberg
+    # itself only pulls it in behind the "pyarrow" extra.
+    "pyiceberg[pyarrow]>=0.11,<1",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8",
+    # Only the test fixtures use pyiceberg's local SqlCatalog (SQLite +
+    # local-disk FileIO, no server) - opteryx_iceberg's own code never
+    # imports it, so this stays out of the main dependency list.
+    "pyiceberg[sql-sqlite]>=0.11,<1",
 ]
 
 [tool.setuptools.package-dir]
