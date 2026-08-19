@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opteryx-iceberg"
+version = "0.1.0"
+description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+    { name = "joocer", email = "justin.joyce@joocer.com" }
+]
+license = { file = "LICENSE" }
+keywords = ["opteryx", "iceberg", "catalog"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
+requires-python = ">=3.11"
+dependencies = [
+    "opteryx-catalog>=0.4.99",
+    "pyiceberg>=0.11,<1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests*", "scripts*"]
+
+[tool.isort]
+profile = "black"
+extend_skip_glob = ["tests/**"]
+skip_gitignore = true
+line_length = 100
+multi_line_output = 9
+force_single_line = true
+float_to_top = true
+ensure_newline_before_comments = true
+
+[tool.ruff]
+line-length = 100
+indent-width = 4
+target-version = 'py313'
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 100
+
+[tool.ruff.lint.isort]
+force-single-line = true
