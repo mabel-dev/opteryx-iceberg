@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -30,7 +30,14 @@ dependencies = [
     # IcebergFileIO (fileio.py) wraps pyiceberg's PyArrowFileIO unconditionally,
     # so pyarrow is a hard runtime dependency here, not optional - pyiceberg
     # itself only pulls it in behind the "pyarrow" extra.
-    "pyiceberg[pyarrow]>=0.11,<1",
+    #
+    # Pinned to the 0.12.0rc1 prerelease, not >=0.11,<1: 0.11.1 is the latest
+    # STABLE release and it ships no cp314 wheel at all (checked PyPI's file
+    # listing directly - cp310 through cp313 only), which breaks worker.opteryx
+    # (Python 3.14, deliberately built with no Rust/C toolchain, so there's no
+    # fallback to a source build). 0.12.0rc1 is the first release with a cp314
+    # wheel. Move to a stable >=0.12 once one ships.
+    "pyiceberg[pyarrow]==0.12.0rc1",
 ]
 
 [project.optional-dependencies]
@@ -38,8 +45,9 @@ test = [
     "pytest>=8",
     # Only the test fixtures use pyiceberg's local SqlCatalog (SQLite +
     # local-disk FileIO, no server) - opteryx_iceberg's own code never
-    # imports it, so this stays out of the main dependency list.
-    "pyiceberg[sql-sqlite]>=0.11,<1",
+    # imports it, so this stays out of the main dependency list. Pinned to
+    # match the main dependency - see the note above.
+    "pyiceberg[sql-sqlite]==0.12.0rc1",
 ]
 
 [tool.setuptools.package-dir]
