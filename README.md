@@ -29,7 +29,7 @@ Do **not** pass `workspace=` yourself — `OpteryxConnector` injects it automati
 
 Native (Firestore/GCS-backed) workspaces are entirely unaffected - this only applies to workspaces explicitly registered with `catalog=IcebergMetastore`.
 
-**Keep every kwarg flat and hashable.** `register_workspace` stores its kwargs verbatim, and opteryx-core's connector cache hashes them (`tuple(sorted(connector_entry.items()))` in `opteryx-core/opteryx/connectors/__init__.py`'s `connector_factory`) — a `dict` or `list` value there raises `TypeError: unhashable type: 'dict'`. This is why Google auth is configured via the flat `auth_type="google"` / `google_auth_scopes=(...)` kwargs below rather than pyiceberg's own nested `auth={"type": "google", "google": {...}}` dict — `IcebergMetastore` builds that nested dict internally, after the hashing has already happened.
+**Config passes through to pyiceberg verbatim — nesting included.** Every kwarg after `catalog=` is forwarded untouched to `pyiceberg.catalog.load_catalog`, so pyiceberg's own config shapes (`auth={...}`, `token=`, `credential=`) are used directly. (Earlier versions required flat `auth_type`/`google_auth_scopes` kwargs because opteryx-core's connector cache hashed registration kwargs and a `dict` value broke it; that cache is now keyed by workspace name in opteryx-core's resolution-first connector layer, the flattening is retired, and passing the old flat kwargs raises a clear `ValueError`.)
 
 ### Google auth (BigLake and other Google-fronted REST catalogs)
 
@@ -41,13 +41,12 @@ register_workspace(
     catalog_type="rest",
     uri="https://biglake.googleapis.com/iceberg/v1/restcatalog",
     warehouse="bl://projects/<project>/catalogs/<catalog>",
-    auth_type="google",
-    google_auth_scopes=("https://www.googleapis.com/auth/cloud-platform",),
+    auth={"type": "google", "google": {"scopes": ["https://www.googleapis.com/auth/cloud-platform"]}},
     **{"header.x-goog-user-project": "<project>"},
 )
 ```
 
-`auth_type="google"` wraps pyiceberg's built-in `GoogleAuthManager`, which authenticates via Application Default Credentials and **refreshes the token on every request** — safe for a long-lived server (a manually fetched `gcloud auth print-access-token` bearer token, by contrast, expires within the hour and is only good for one-off scripts/tests). In production this picks up Cloud Run's attached service account automatically, the same way the rest of the deployment already does — no explicit `credentials_path` needed.
+`auth={"type": "google", ...}` selects pyiceberg's built-in `GoogleAuthManager`, which authenticates via Application Default Credentials and **refreshes the token on every request** — safe for a long-lived server (a manually fetched `gcloud auth print-access-token` bearer token, by contrast, expires within the hour and is only good for one-off scripts/tests). In production this picks up Cloud Run's attached service account automatically, the same way the rest of the deployment already does — no explicit `credentials_path` needed. Stored-credential catalogs need no code at all: pass pyiceberg's `token=` or `credential=` the same way.
 
 This is wired into [`worker.opteryx`](../worker.opteryx/app/worker.py) as the `tarchia` workspace, alongside the native `mabel_data` registration - reads from it go through the exact same query path as any native table (verified with a real `SELECT ... FROM tarchia.interop_ns.people`).
 

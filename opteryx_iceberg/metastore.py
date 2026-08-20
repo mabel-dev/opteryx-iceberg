@@ -34,47 +34,42 @@ class IcebergMetastore(Metastore):
         self,
         workspace: str,
         catalog_type: str = "rest",
-        auth_type: str | None = None,
-        google_auth_scopes: tuple[str, ...] | None = None,
         **properties,
     ):
         """
         Args:
             workspace: the Opteryx workspace prefix this instance was
-                registered under (via `register_workspace`) - kept for
-                parity with `OpteryxCatalog`'s constructor shape, not
-                currently used to namespace pyiceberg calls.
+                registered under (via `register_workspace` or a workspace
+                resolver) - kept for parity with `OpteryxCatalog`'s
+                constructor shape, not currently used to namespace
+                pyiceberg calls.
             catalog_type: pyiceberg catalog type ("rest", "sql", "hive",
                 "glue", ...) - passed through as `properties["type"]`.
-            auth_type: currently only "google" is wired up - builds
-                pyiceberg's `GoogleAuthManager` config (auto-refreshing via
-                Application Default Credentials, so a long-lived server
-                doesn't need to babysit a short-lived static token).
-            google_auth_scopes: OAuth2 scopes for `auth_type="google"`.
-            **properties: forwarded to `pyiceberg.catalog.load_catalog`
-                (e.g. `uri`, `warehouse`, credentials).
+            **properties: forwarded VERBATIM to
+                `pyiceberg.catalog.load_catalog` (e.g. `uri`, `warehouse`,
+                `token`, `credential`, `auth={...}`). Values may be
+                arbitrarily nested - pyiceberg's own config shapes, such
+                as `auth={"type": "google", "google": {"scopes": [...]}}`,
+                are used directly.
 
-        Deliberately flat/hashable kwargs, not pyiceberg's own nested
-        `auth={"type": ..., "google": {...}}` dict: `register_workspace`
-        stores these kwargs verbatim, and opteryx-core's connector cache
-        hashes them (`tuple(sorted(connector_entry.items()))` in
-        `connectors/__init__.py`'s `connector_factory`) - a dict value
-        there raises `TypeError: unhashable type: 'dict'`. The nested dict
-        pyiceberg actually wants is only ever built here, in-process, never
-        round-tripped through that cache key.
+        This class used to accept flat `auth_type`/`google_auth_scopes`
+        kwargs and rebuild pyiceberg's nested `auth` dict internally,
+        because opteryx-core's connector cache hashed registration kwargs
+        and a dict value broke it. That cache is now keyed by workspace
+        name (opteryx-core's resolution-first connector layer), nothing
+        hashes config any more, and the flattening is retired - the guard
+        below turns a stale flat-style config into a clear error instead
+        of silently unauthenticated requests.
         """
+        for retired in ("auth_type", "google_auth_scopes"):
+            if retired in properties:
+                raise ValueError(
+                    f"opteryx-iceberg: {retired!r} is retired - pass pyiceberg's own "
+                    'nested form instead, e.g. auth={"type": "google", "google": '
+                    '{"scopes": ["https://www.googleapis.com/auth/cloud-platform"]}}.'
+                )
         self.workspace = workspace
-        load_properties = dict(properties)
-        if auth_type == "google":
-            load_properties["auth"] = {
-                "type": "google",
-                "google": {"scopes": list(google_auth_scopes) if google_auth_scopes else None},
-            }
-        elif auth_type is not None:
-            raise NotImplementedError(
-                f"opteryx-iceberg: auth_type={auth_type!r} is not wired up - only 'google' is."
-            )
-        self._catalog = load_catalog(workspace, type=catalog_type, **load_properties)
+        self._catalog = load_catalog(workspace, type=catalog_type, **properties)
         self.io = IcebergFileIO(properties)
 
     def load_dataset(self, identifier: str, load_history: bool = False) -> IcebergDataset:
