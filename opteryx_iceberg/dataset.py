@@ -57,6 +57,12 @@ def _display_type(field_type: Any) -> str:
 
 
 class IcebergDataset(Dataset):
+    # `_decode_bound` hands back what `from_bytes` decodes -- a real `str` for
+    # a StringType column, a real `float` for a DoubleType -- not the ordinal
+    # int64 keys opteryx-catalog's own stats builder writes. See the contract
+    # on `Dataset.bounds_are_ordinal` for what mis-declaring this does.
+    bounds_are_ordinal = False
+
     def __init__(self, identifier: str, table):
         self.identifier = identifier
         self._table = table
