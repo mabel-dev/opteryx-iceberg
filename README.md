@@ -50,7 +50,25 @@ register_workspace(
 
 This is wired into [`worker.opteryx`](../worker.opteryx/app/worker.py) as the `tarchia` workspace, alongside the native `mabel_data` registration - reads from it go through the exact same query path as any native table (verified with a real `SELECT ... FROM tarchia.interop_ns.people`).
 
-**Local-dev only for now**: `worker.opteryx` reaches `opteryx_iceberg` via the same `sys.path` sibling-checkout convention as `opteryx-core`/`opteryx-catalog`/`opteryx-access` (never `pip install -e`) - see its `pyproject.toml`, which does *not* yet list `opteryx-iceberg` as a real dependency, since it isn't published anywhere yet. A production Cloud Run deploy of `worker.opteryx` would need that resolved first (publish `opteryx-iceberg` somewhere installable, or vendor it) - the `tarchia` registration works today for local runs only.
+**Published on PyPI**: `worker.opteryx` depends on `opteryx-iceberg>=0.1.2` as a real dependency in its `pyproject.toml`, alongside `opteryx-core`, `opteryx-catalog[kms]` and `opteryx-access` - no `sys.path` sibling-checkout shim, no vendoring. The `tarchia` registration therefore works in a production Cloud Run deploy the same way it works locally. (The `sys.path` convention still applies to this repo's *own* tests, which resolve sibling `opteryx-catalog`/`opteryx-core` checkouts - see [Local development](#local-development).)
+
+### SQL catalogs: the pyiceberg catalog name must equal the workspace prefix
+
+`IcebergMetastore` passes the Opteryx workspace prefix straight through as pyiceberg's catalog *name*: `load_catalog(workspace, ...)`. For REST/Hive/Glue that name is a local label and nothing on the wire depends on it. **For `catalog_type="sql"` it is part of the data.** pyiceberg's `SqlCatalog` stores its name in the `catalog_name` column of its metadata tables and filters every lookup on it, so a table written under catalog name `warehouse` is simply not there when read back under the name `my_workspace`.
+
+The failure is silent and unhelpful: `load_dataset` gets `NoSuchTableError` and raises a bare `DatasetNotFound`, exactly as if the table had never been created. There is no hint that the metadata row exists under a different catalog name.
+
+So when pointing Opteryx at a local/SQL Iceberg catalog, whoever wrote the tables must have used the same catalog name as the workspace prefix you register:
+
+```python
+# writer
+SqlCatalog("my_workspace", uri="sqlite:///.../catalog.db", warehouse="file:///...")
+
+# reader - the prefix here becomes the pyiceberg catalog name
+register_workspace("my_workspace", OpteryxConnector, catalog=IcebergMetastore, catalog_type="sql", ...)
+```
+
+If you already have a SQL catalog written under a different name, either register the Opteryx workspace under that name or rewrite the `catalog_name` values in the catalog's metadata table.
 
 ## What's supported
 

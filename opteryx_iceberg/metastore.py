@@ -40,9 +40,20 @@ class IcebergMetastore(Metastore):
         Args:
             workspace: the Opteryx workspace prefix this instance was
                 registered under (via `register_workspace` or a workspace
-                resolver) - kept for parity with `OpteryxCatalog`'s
-                constructor shape, not currently used to namespace
-                pyiceberg calls.
+                resolver). Passed straight through as pyiceberg's catalog
+                *name*: `load_catalog(workspace, ...)`.
+
+                For REST/Hive/Glue that name is a local label and nothing
+                on the wire depends on it. For `catalog_type="sql"` it is
+                part of the data: pyiceberg's `SqlCatalog` stores its name
+                in the `catalog_name` column of its metadata tables and
+                filters every lookup on it, so tables written under a
+                different catalog name are invisible here - `load_dataset`
+                gets `NoSuchTableError` and raises a bare `DatasetNotFound`,
+                indistinguishable from the table never having existed.
+                Whoever wrote a SQL catalog must therefore have used the
+                same catalog name as the Opteryx workspace prefix it is
+                registered under.
             catalog_type: pyiceberg catalog type ("rest", "sql", "hive",
                 "glue", ...) - passed through as `properties["type"]`.
             **properties: forwarded VERBATIM to

@@ -109,3 +109,27 @@ def test_writes_are_not_implemented(tmp_path):
         raise AssertionError("expected NotImplementedError")
     except NotImplementedError:
         pass
+
+
+def test_display_types_preserve_physical_width():
+    """Iceberg's 4-byte types must not be declared as 8-byte Opteryx types.
+
+    The type this returns is what opteryx-core binds the column to, and the
+    reader then reads the parquet column at the bound type's width - so
+    declaring IntegerType as INT64 or FloatType as FLOAT64 makes the reader take
+    8 bytes per value out of a 4-byte column. The values are garbage, they vary
+    between runs, and predicates over the column silently return an arbitrary
+    number of rows. INTEGER/BIGINT and DOUBLE/FLOAT are interchangeable names in
+    SQL; the widths behind them are not interchangeable here.
+    """
+    from pyiceberg.types import DoubleType
+    from pyiceberg.types import FloatType
+    from pyiceberg.types import IntegerType
+    from pyiceberg.types import LongType
+
+    from opteryx_iceberg.dataset import _display_type
+
+    assert _display_type(IntegerType()) == "INT32"
+    assert _display_type(LongType()) == "INT64"
+    assert _display_type(FloatType()) == "FLOAT32"
+    assert _display_type(DoubleType()) == "FLOAT64"

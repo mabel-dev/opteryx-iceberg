@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.3"
+version = "0.1.4"
 description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -48,6 +48,10 @@ test = [
     # imports it, so this stays out of the main dependency list. Pinned to
     # match the main dependency - see the note above.
     "pyiceberg[sql-sqlite]==0.12.0rc1",
+    # tests/test_end_to_end_sql.py runs real SQL through the engine rather than
+    # stopping at the Metastore surface, so the engine itself is a test-only
+    # dependency. opteryx_iceberg's own code never imports opteryx.
+    "opteryx-core>=0.9.77",
 ]
 
 [tool.setuptools.package-dir]

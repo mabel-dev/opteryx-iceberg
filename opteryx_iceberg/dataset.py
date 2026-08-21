@@ -30,12 +30,21 @@ from pyiceberg.types import UUIDType
 # opteryx_catalog.catalog.dataset._stored_type_display for the native path's
 # equivalent). Nested types (Struct/Map/List) are not in Tier 1's scope -
 # _display_type raises rather than silently misrepresenting them as VARCHAR.
+# Widths are NOT interchangeable here, even though INTEGER/BIGINT and
+# DOUBLE/FLOAT are interchangeable *names* in SQL. The type this returns is what
+# opteryx-core binds the column to, and the reader then reads the parquet column
+# at the bound type's width: declaring Iceberg's 4-byte IntegerType as INT64, or
+# its 4-byte FloatType as FLOAT64, makes the reader take 8 bytes per value from a
+# 4-byte column. That is not a rounding difference - the values are garbage, they
+# vary run to run, and predicates over the column return an arbitrary and
+# unstable number of rows with no error. Map each Iceberg type to the Opteryx
+# type of the SAME physical width and let the engine widen if it wants to.
 _PRIMITIVE_TYPES = {
     BooleanType: "BOOLEAN",
-    IntegerType: "INTEGER",
-    LongType: "BIGINT",
-    FloatType: "DOUBLE",
-    DoubleType: "DOUBLE",
+    IntegerType: "INT32",
+    LongType: "INT64",
+    FloatType: "FLOAT32",
+    DoubleType: "FLOAT64",
     DateType: "DATE",
     TimestampType: "TIMESTAMP",
     TimestamptzType: "TIMESTAMP",
@@ -133,6 +142,27 @@ class IcebergDataset(Dataset):
                     # pruning already falls back cleanly to "no sketches".
                 }
             )
+
+    def manifest_sketch_vectors(self, snapshot_id: int | None = None) -> dict:
+        """Always empty: Iceberg manifests carry no sketch columns.
+
+        opteryx-core probes for this accessor with `getattr(table, ...)` and
+        treats its absence as "the catalog is too old to expose native sketch
+        vectors", logging a warning that tells the operator to upgrade
+        opteryx_catalog. For an Iceberg-backed workspace that advice is
+        unactionable - no version of opteryx_catalog puts NDV/histogram
+        sketches into an Iceberg manifest, because the Iceberg spec has no
+        field to hold them (see `scan`, which likewise emits no
+        min_k_hashes/histogram_counts).
+
+        `{}` is not a stub to silence the warning - it is the accessor's own
+        answer for "this snapshot has no sketch columns", identical to what
+        opteryx_catalog returns for a snapshot with no manifest, and identical
+        to the value opteryx-core's fallback branch assigns anyway. Defining it
+        changes no query result; it only stops the engine from misreporting an
+        inherent property of the format as a stale dependency.
+        """
+        return {}
 
     def append(self, table):
         raise NotImplementedError(
