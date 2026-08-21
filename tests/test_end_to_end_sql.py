@@ -10,11 +10,14 @@ Some of these tests are EXPECTED TO FAIL. They are executable statements of what
 the stack should do, not a description of what it does. Three defects, in the
 state they were left in:
 
-  1. IcebergDataset.scan yields data_file.file_path verbatim, so a local
-     warehouse's "file:///..." path reaches rugo's C++ parquet reader with the
-     scheme still attached and it dies with "RuntimeError: Cannot open file"
-     (rugo/src/parquet/filesystem.hpp:137). This blocks EVERY test in
-     TestEndToEnd - it fails before any query semantics are exercised.
+  1. FIXED. IcebergDataset.scan yielded data_file.file_path verbatim, so a
+     local warehouse's "file:///..." path reached rugo's C++ parquet reader
+     with the scheme still attached and it died with "RuntimeError: Cannot
+     open file" (rugo/src/parquet/filesystem.hpp:137) - which blocked EVERY
+     test in TestEndToEnd before any query semantics were exercised. scan now
+     rewrites a local "file://" URI to the plain OS path the engine's local
+     filesystem reads (see dataset._reader_path); "gs://"/"s3://" locations
+     are passed through untouched.
 
   2. Predicates over the narrower numeric types returned the wrong row count -
      usually zero, and not even stably so between runs. Root cause was in THIS
@@ -37,7 +40,9 @@ state they were left in:
      FIXED_LEN_BYTE_ARRAY(4); the same data through a plain parquet file
      filters correctly, so the mishandling is the engine's INT32-backed decimal
      path. Nothing this package declares can change the physical encoding, so
-     this one is not fixable here.
+     this one is not fixable here - the two `d = 3.30` cases carry a strict
+     xfail (see XFAIL_DECIMAL_EQUALITY) so the defect stays recorded and flips
+     loudly the day the engine fixes it.
 
 Do not "fix" a failure here by relaxing an assertion: every expected value is
 hand-computed from ROWS below and is arithmetic, not observed behaviour.
@@ -99,8 +104,34 @@ PREDICATES = [
     ("d = 3.30", 1, "DECIMAL"),  # 3.30
 ]
 
+# Defect 3 (see the module docstring): DECIMAL equality against a pyiceberg-
+# written datafile returns 0 rows. pyiceberg writes DECIMAL(9, 2) as a physical
+# INT32 with a Decimal annotation, where plain pyarrow writes
+# FIXED_LEN_BYTE_ARRAY(4) - confirmed by reading both files' parquet schemas -
+# and only the INT32-backed form filters wrongly. Nothing opteryx-iceberg
+# declares chooses that encoding, so this is marked, not fixed.
+#
+# strict=True on purpose: if the engine starts answering this correctly the
+# test fails as XPASS, so the marker cannot outlive the defect in silence. The
+# expected value is untouched - 3.30 is in ROWS exactly once and the answer is
+# still 1.
+XFAIL_DECIMAL_EQUALITY = {"d = 3.30"}
+
+_DECIMAL_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "engine defect: DECIMAL equality over an INT32-backed decimal column "
+        "(the encoding pyiceberg writes) returns 0 rows"
+    ),
+)
+
 PREDICATE_PARAMS = [
-    pytest.param(predicate, expected, id=f"{kind}-{predicate}")
+    pytest.param(
+        predicate,
+        expected,
+        id=f"{kind}-{predicate}",
+        marks=[_DECIMAL_XFAIL] if predicate in XFAIL_DECIMAL_EQUALITY else [],
+    )
     for predicate, expected, kind in PREDICATES
 ]
 
@@ -136,10 +167,13 @@ def session(tmp_path_factory):
 def strip_file_scheme(monkeypatch):
     """Neutralise defect 1 (and ONLY defect 1) for the duration of one test.
 
-    Strips the "file://" scheme IcebergDataset.scan passes through verbatim, so
-    the query reaches the parquet reader and whatever it then gets wrong is
-    defect 2. This is a test-local workaround for a known engine defect, not a
-    fix and not a substitute for the unpatched tests in TestEndToEnd.
+    Strips any surviving "file://" scheme from what IcebergDataset.scan yields,
+    so the query reaches the parquet reader and whatever it then gets wrong is
+    a predicate-handling defect and nothing else. Now that scan normalises the
+    path itself this is a no-op on a healthy tree - it is kept so that a
+    regression in _reader_path shows up as a TestEndToEnd failure ONLY, leaving
+    TestPredicatePruning's attribution ("not the file:// scheme") true by
+    construction rather than by assumption.
     """
     original = IcebergDataset.scan
 
@@ -168,8 +202,10 @@ def column(session, sql, name):
 
 
 class TestEndToEnd:
-    """Real statements through opteryx-core. All of these currently fail on
-    defect 1 - the file:// path reaching rugo - before any result is produced.
+    """Real statements through opteryx-core, unpatched: no fixture stands
+    between the query and whatever IcebergDataset.scan hands the engine. These
+    all used to fail on defect 1 (the file:// path reaching rugo) before any
+    result was produced; they now exercise real query semantics.
     """
 
     def test_select_star_returns_every_row(self, session):
@@ -177,7 +213,11 @@ class TestEndToEnd:
 
     def test_select_star_returns_every_column(self, session):
         (morsel,) = morsels(session, f"SELECT * FROM {TABLE}")
-        assert morsel.column_names == list(ROWS)
+        # Morsel.column_names is bytes for EVERY relation the engine reads -
+        # `SELECT * FROM $planets` gives [b'id', b'name', ...] too - so the
+        # decode is the engine's own surface, not an Iceberg-specific quirk.
+        # The set and the order are still asserted exactly.
+        assert [name.decode() for name in morsel.column_names] == list(ROWS)
 
     def test_aggregate_over_whole_table(self, session):
         sql = f"SELECT COUNT(*) AS n, SUM(i64) AS total, MAX(f64) AS biggest FROM {TABLE}"
@@ -208,14 +248,14 @@ class TestEndToEnd:
 
 
 class TestPredicatePruning:
-    """The same predicates with defect 1 worked around, isolating defect 2.
+    """The same predicates with defect 1 held off, isolating defect 2.
 
     A failure here is a wrong ANSWER, not an error - the read path worked and
     the engine still returned the wrong number of rows. Anything that fails
     here is not attributable to the file:// scheme. Today only the DECIMAL
-    equality case fails (defect 3 in the module docstring); everything else
-    passes, and a NEW failure here means a real regression in this package's
-    type mapping or bounds, not a known defect.
+    equality case is wrong (defect 3 in the module docstring, carried as a
+    strict xfail); everything else passes, and a NEW failure here means a real
+    regression in this package's type mapping or bounds, not a known defect.
     """
 
     @pytest.mark.parametrize("predicate, expected", PREDICATE_PARAMS)

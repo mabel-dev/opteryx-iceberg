@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from typing import Any
+from urllib.parse import unquote
+from urllib.parse import urlparse
 
 from opteryx_catalog.catalog.dataset import Datafile
 from opteryx_catalog.catalog.dataset import RelationSchema
@@ -130,7 +132,7 @@ class IcebergDataset(Dataset):
             ]
             yield Datafile(
                 entry={
-                    "file_path": data_file.file_path,
+                    "file_path": _reader_path(data_file.file_path),
                     "record_count": data_file.record_count,
                     "file_size_in_bytes": data_file.file_size_in_bytes,
                     "field_ids": field_ids,
@@ -168,6 +170,33 @@ class IcebergDataset(Dataset):
         raise NotImplementedError(
             "opteryx-iceberg (Tier 1) is read-only - writing is Tier 2 scope."
         )
+
+
+def _reader_path(file_path: str) -> str:
+    """Iceberg's location -> the form opteryx-core's reader can open.
+
+    Iceberg records every datafile location as a URI, so a local warehouse
+    yields "file:///var/.../x.parquet". Opteryx routes on the scheme prefix
+    (opteryx/connectors/io_systems/__init__.py maps "gs", "http(s)", "file"
+    and "" to a filesystem) but its local filesystem is the plain-OS-path
+    branch: MemoryMappedFile mmaps the string as given, and rugo's C++ reader
+    raises "RuntimeError: Cannot open file: file:///..." on a path that still
+    carries the scheme. Only "file://" is rewritten - "gs://" and "s3://"
+    locations are the form their readers want and are passed through
+    untouched.
+
+    The path component is percent-decoded, since that is what a URI's path is:
+    a warehouse directory containing a space is written as "%20" by pyiceberg
+    and must reach the reader as a space. A "file://host/path" authority other
+    than "localhost" is a remote share this reader cannot open, so it is left
+    alone rather than silently reinterpreted as a local path.
+    """
+    if not file_path.startswith("file://"):
+        return file_path
+    parsed = urlparse(file_path)
+    if parsed.netloc not in ("", "localhost"):
+        return file_path
+    return unquote(parsed.path)
 
 
 def _decode_bound(bounds: dict | None, field_id: int, field_by_id: dict) -> Any:
