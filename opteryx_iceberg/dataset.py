@@ -228,11 +228,33 @@ class IcebergDataset(Dataset):
                 return IcebergSnapshot(snap)
         return None
 
-    def schema(self, schema_id: str | None = None) -> RelationSchema | None:
-        # pyiceberg tables carry one live schema per snapshot lineage;
-        # schema_id (opteryx-catalog's historical-schema lookup) has no
-        # equivalent here - Tier 1 always returns the table's current schema.
-        iceberg_schema = self._table.schema()
+    def schema(self, schema_id: str | int | None = None) -> RelationSchema | None:
+        """The table's schema, or the historical schema `schema_id` names.
+
+        Resolving `schema_id` matters for TIME TRAVEL and nothing else: reading
+        an old snapshot through the CURRENT schema reports columns that did not
+        exist yet. `SELECT *` at a pre-`ADD COLUMN` snapshot listed the added
+        column, with no error and no way for the caller to tell.
+
+        Iceberg keeps every schema the table has had (`Table.schemas()`, keyed
+        by id) and every snapshot records the id it was written under, so the
+        right schema is a lookup. An id that is not in that map falls back to
+        the current schema: a snapshot naming a schema the table no longer
+        retains is a damaged table, and answering with today's columns is the
+        same thing this did for every snapshot before - degraded, not worse.
+        """
+        iceberg_schema = None
+        if schema_id is not None:
+            # IcebergSnapshot stringifies schema_id for the VARCHAR output
+            # column, so it arrives here as "0" as often as 0.
+            try:
+                wanted = int(schema_id)
+            except (TypeError, ValueError):
+                wanted = None
+            if wanted is not None:
+                iceberg_schema = self._table.schemas().get(wanted)
+        if iceberg_schema is None:
+            iceberg_schema = self._table.schema()
         columns = [
             SchemaColumn(
                 name=field.name,
@@ -252,6 +274,7 @@ class IcebergDataset(Dataset):
 
         table_scan = self._table.scan(snapshot_id=snapshot_id)
         for task in table_scan.plan_files():
+            _reject_merge_on_read(task, self.identifier)
             data_file = task.file
             field_ids = sorted(
                 set(data_file.lower_bounds or {}) | set(data_file.upper_bounds or {})
@@ -304,6 +327,42 @@ class IcebergDataset(Dataset):
     def append(self, table):
         raise NotImplementedError(
             "opteryx-iceberg (Tier 1) is read-only - writing is Tier 2 scope."
+        )
+
+
+def _reject_merge_on_read(task: Any, identifier: str) -> None:
+    """Refuse a scan task carrying Iceberg delete files.
+
+    Iceberg v2 has two ways to express a delete. COPY-ON-WRITE rewrites the
+    data file without the deleted rows, and the rows are simply gone - that is
+    what pyiceberg itself writes, and it needs nothing from us. MERGE-ON-READ
+    instead leaves the data file alone and commits a DELETE FILE beside it
+    (positional: "rows 3 and 7 of this file are dead"; equality: "any row where
+    id = 42 is dead"), and the reader is required to subtract them at scan
+    time.
+
+    This package does not do that subtraction. Handing the data file over as-is
+    would return every deleted row as live data - the wrong answer, silently,
+    with no error and nothing in the result to hint at it. Refusing is strictly
+    better: a query that fails is a query nobody acts on.
+
+    This is NOT reachable from a table pyiceberg wrote. pyiceberg has no
+    merge-on-read write path at all ("Merge on read is not yet supported,
+    falling back to copy-on-write"), so the local SqlCatalog suite cannot
+    construct the condition - which is exactly why the guard is here rather
+    than left to be noticed. Spark, Flink and Trino DO write merge-on-read
+    deletes, and a remote catalog is usually one of those writing.
+
+    Lifting this means implementing delete application (positional and
+    equality), which is a different and much larger piece of work.
+    """
+    delete_files = getattr(task, "delete_files", None)
+    if delete_files:
+        raise NotImplementedError(
+            f"opteryx-iceberg (Tier 1, read-only) cannot read {identifier!r}: it "
+            f"has merge-on-read delete files ({len(delete_files)} on one data "
+            "file), and reading it without applying them would return deleted "
+            "rows as live data. Only copy-on-write tables are supported."
         )
 
 

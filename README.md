@@ -77,6 +77,9 @@ If you already have a SQL catalog written under a different name, either registe
 - Time travel: `VERSION AS OF <snapshot-id>`, `VERSION AS OF PREVIOUS` (walks Iceberg's `parent_snapshot_id`), and `TIMESTAMP AS OF '<ts>'` (point-in-time, resolved against the commit history; a timestamp before the first commit is an error, not an empty result).
 - `SHOW MANIFEST FOR <table>` — one row per live data file, with the real decoded Iceberg bounds.
 - `SHOW SNAPSHOTS FOR <table>` — the commit history, newest first.
+- `information_schema.tables` / `.columns`, and `SHOW COLUMNS` / `DESCRIBE`.
+- Partitioned tables, including predicates over the partition column.
+- Schema evolution: a time-travel read resolves the *historical* schema the snapshot was written under, so a snapshot taken before an `ADD COLUMN` does not report the column that did not exist yet.
 
 ### What `SHOW SNAPSHOTS` can and cannot tell you about an Iceberg table
 
@@ -94,10 +97,14 @@ The counter columns come from the snapshot summary, which Iceberg holds as strin
 
 ## What's not (yet)
 
+- **Merge-on-read delete files.** Iceberg v2 can express a delete either by rewriting the data file (copy-on-write) or by committing a *delete file* beside it (merge-on-read) that the reader must subtract at scan time. This package does not do that subtraction, so a table carrying delete files is **refused** with a `NotImplementedError` naming the cause, rather than read — reading it without applying them would return deleted rows as live data, silently.
+
+  Copy-on-write tables are unaffected, and that is everything `pyiceberg` itself writes (it has no merge-on-read write path). **Spark, Flink and Trino do write merge-on-read deletes**, so this is the limitation most likely to be met on a remote catalog written by something other than pyiceberg. Lifting it means implementing positional and equality delete application.
 - Any write path: `CREATE`/`DROP`/`ALTER`/`INSERT`/`rename` all raise `NotImplementedError` — that's Tier 2.
 - Iceberg views (Iceberg's view spec has no equivalent here yet).
 - Opteryx's own sketch-based pruning stats (`min_k_hashes`/histograms) — standard Iceberg manifests don't carry them; queries fall back to standard bounds-based pruning.
-- Nested Iceberg types (struct/map/list) — `IcebergDataset.schema()` raises rather than silently misrepresenting them.
+- Nested Iceberg types (struct/map/list) — `IcebergDataset.schema()` raises rather than silently misrepresenting them. Note this makes a table with *any* nested column unreadable, including for a query that touches only its scalar columns.
+- Iceberg's own triggers/views listings (`list_views`/`list_triggers` return empty, which is the truthful answer for a Tier 1 reader rather than a stub).
 
 ## Local development
 

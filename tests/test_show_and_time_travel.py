@@ -67,7 +67,7 @@ def fixture(tmp_path_factory):
     writer.create_namespace("ns")
     table = writer.create_table("ns.t", schema=ROWS_V1.schema)
     table.append(ROWS_V1)
-    time.sleep(1.1)
+    time.sleep(2.2)
     table.append(ROWS_V2)
 
     snapshots = sorted(table.snapshots(), key=lambda s: s.timestamp_ms)
@@ -128,8 +128,14 @@ class TestTimeTravel:
         assert "1234567" in str(caught.value)
 
     def test_timestamp_as_of_between_the_commits_sees_the_first(self, fixture):
+        # The first whole second STRICTLY AFTER commit one. Adding a sub-second
+        # offset instead would be flaky: the literal is truncated to seconds,
+        # so first-commit-at-x.300 plus 500ms formats back to x.000 - before
+        # the commit it was meant to follow, and the read fails as "no data at
+        # that date". Rounding up cannot land before commit one, and the
+        # fixture's 2s gap keeps it before commit two.
         between = datetime.datetime.fromtimestamp(
-            (fixture["first"].timestamp_ms + 500) / 1000
+            (fixture["first"].timestamp_ms // 1000) + 1
         )
         sql = (
             f"SELECT COUNT(*) FROM {TABLE} "

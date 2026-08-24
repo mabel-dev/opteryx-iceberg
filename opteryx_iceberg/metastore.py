@@ -116,9 +116,61 @@ class IcebergMetastore(Metastore):
         return self._catalog.namespace_exists(self._to_iceberg_namespace(namespace))
 
     def list_datasets(self, namespace: str) -> Iterable[str]:
-        return [
-            ".".join(identifier) for identifier in self._catalog.list_tables(namespace)
-        ]
+        """Table names within `namespace`, BARE - not namespace-qualified.
+
+        This matches the native catalog, which returns the dataset document's
+        own id (`OpteryxCatalog.list_datasets` -> `doc.id`), and it is what
+        information_schema requires: it pairs each name with the collection it
+        asked for (`table_schema=collection, table_name=name`), so a qualified
+        name here becomes `ns.ns.t` and every lookup built from it fails with
+        DatasetNotFound.
+
+        pyiceberg returns the FULL identifier tuple ("ns", "t") - the namespace
+        is the leading part and the table name is the last element, nested
+        namespaces included (("a", "b", "t") is table "t" in namespace "a.b").
+        """
+        return [identifier[-1] for identifier in self._catalog.list_tables(namespace)]
+
+    # ------------------------------------------------------------------
+    # information_schema's listing surface.
+    #
+    # opteryx-core's information_schema walks a catalog with six methods:
+    # list_collections -> list_datasets -> list_views / list_triggers, plus
+    # load_dataset / load_view. Only the first three are answerable from an
+    # Iceberg catalog; without them `SELECT ... FROM <ws>.information_schema.
+    # tables` died on AttributeError rather than on anything a user could act
+    # on.
+    #
+    # `list_views` and `list_triggers` return EMPTY rather than raising, and
+    # that is a real answer, not a stub: an Iceberg catalog has no triggers at
+    # all (they are an opteryx concept), and Tier 1 does not read the Iceberg
+    # view spec, so there are none of either to report. Raising would take
+    # information_schema down over a table listing that is otherwise correct -
+    # the datasets are the part anyone is asking for.
+    # ------------------------------------------------------------------
+
+    def list_collections(self) -> Iterable[str]:
+        """Namespaces, dotted, matching the shape `list_datasets` takes back.
+
+        pyiceberg hands back tuples ("ns",) / ("a", "b") for nested
+        namespaces; opteryx speaks one dotted string.
+        """
+        return [".".join(namespace) for namespace in self._catalog.list_namespaces()]
+
+    def list_views(self, namespace: str) -> Iterable[str]:
+        """Always empty - Tier 1 does not read the Iceberg view spec.
+
+        See the section comment above for why this is empty rather than
+        NotImplementedError, unlike `load_view`: that answers "give me THIS
+        view", where being wrong matters; this answers "which views are
+        there", and for a Tier 1 reader the truthful answer is none.
+        """
+        return []
+
+    def list_triggers(self, identifier: str) -> Iterable[str]:
+        """Always empty - triggers are an opteryx concept with no Iceberg
+        equivalent, so there is nothing an Iceberg catalog could report."""
+        return []
 
     def create_dataset(self, identifier: str, schema, properties=None, author=None):
         raise NotImplementedError(
