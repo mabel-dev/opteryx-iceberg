@@ -26,7 +26,7 @@ classifiers = [
 urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
 requires-python = ">=3.11"
 dependencies = [
-    "opteryx-catalog>=0.4.99",
+    "opteryx-catalog>=0.4.104",
     # IcebergFileIO (fileio.py) wraps pyiceberg's PyArrowFileIO unconditionally,
     # so pyarrow is a hard runtime dependency here, not optional - pyiceberg
     # itself only pulls it in behind the "pyarrow" extra.
