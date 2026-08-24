@@ -74,6 +74,23 @@ If you already have a SQL catalog written under a different name, either registe
 
 - `SELECT` queries against existing Iceberg tables, including predicate pushdown/pruning via standard Iceberg manifest bounds (`min_values`/`max_values`/`null_counts`).
 - Schema introspection (`DESCRIBE`, information_schema).
+- Time travel: `VERSION AS OF <snapshot-id>`, `VERSION AS OF PREVIOUS` (walks Iceberg's `parent_snapshot_id`), and `TIMESTAMP AS OF '<ts>'` (point-in-time, resolved against the commit history; a timestamp before the first commit is an error, not an empty result).
+- `SHOW MANIFEST FOR <table>` — one row per live data file, with the real decoded Iceberg bounds.
+- `SHOW SNAPSHOTS FOR <table>` — the commit history, newest first.
+
+### What `SHOW SNAPSHOTS` can and cannot tell you about an Iceberg table
+
+opteryx-core's snapshot output was defined against opteryx-catalog's own commit records, which are richer than Iceberg's. `IcebergSnapshot` (in `dataset.py`) adapts a pyiceberg snapshot into that shape; three columns are **always `NULL`** for an Iceberg-backed table, because the Iceberg spec has nowhere to record them:
+
+| Column | Why it is null |
+|---|---|
+| `author` | Iceberg records no committer identity |
+| `commit_message` | Iceberg records no commit message |
+| `user_created` | opteryx's user-vs-system commit distinction has no Iceberg equivalent |
+
+`operation_type` is the Iceberg spec's own lowercase name (`append`, `overwrite`, `delete`, `replace`). Note that a row-level **delete is reported as `overwrite`** — that is what pyiceberg commits, not a mistranslation here.
+
+The counter columns come from the snapshot summary, which Iceberg holds as strings and populates *per operation*: an `append` records no `deleted-*` counters at all. Those arrive as `NULL` — meaning "this commit does not report it", not zero, which would claim the commit deleted nothing.
 
 ## What's not (yet)
 

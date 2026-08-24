@@ -209,3 +209,6 @@ __marimo__/
 
 # Debug/inspection output from scripts/inspect_* and OPTERYX_TEST_ARTIFACTS runs
 artifacts/
+
+# local investigation notes, not part of the package
+scratch/

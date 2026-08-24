@@ -67,6 +67,129 @@ def _display_type(field_type: Any) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# SHOW SNAPSHOTS FOR
+#
+# opteryx-core normalizes a commit history through
+# `opteryx.models.snapshot_history.normalize_snapshot`, which reads its fields
+# off the snapshot BY ATTRIBUTE - it was written against opteryx_catalog's own
+# `Snapshot` dataclass and takes it straight in. A pyiceberg `Snapshot` is not
+# that shape: it has snapshot_id/parent_snapshot_id/sequence_number/
+# timestamp_ms/schema_id, and no `operation_type`, `author`, `user_created` or
+# `commit_message` at all - so handing one over raises AttributeError and the
+# statement fails outright.
+#
+# The adaptation belongs HERE, for the same reason `scan` builds
+# opteryx_catalog's `Datafile` rather than teaching opteryx-core about
+# pyiceberg: the Dataset boundary is where a backend meets the engine's
+# vocabulary. normalize_snapshot's own docstring says the connector normalizes
+# "so a second connector with a commit log answers the same statement by
+# producing the same dicts" - this is that.
+#
+# Two mappings are NOT identity and are the whole reason this class exists
+# rather than a `getattr` default in the engine:
+#
+# 1. `summary` values are STRINGS in Iceberg ("609"), and every counter column
+#    in the output is INT64. Passed through raw they reach a typed vector
+#    builder as text. `_summary_int` coerces, and a value that is not an
+#    integer becomes None (unknown) rather than 0 - claiming a commit added
+#    nothing is a worse answer than admitting the counter is unreadable.
+#
+# 2. Iceberg spells the deleted-bytes counter `removed-files-size`; opteryx's
+#    column is `deleted-files-size`. The other eight counters share a spelling
+#    with the Iceberg spec exactly. Mapped explicitly below, because a silent
+#    miss here is an all-null column rather than an error.
+#
+# Fields Iceberg genuinely does not record are None, never invented:
+# `author` and `commit_message` have no Iceberg equivalent (the spec has no
+# notion of who committed or why), and `user_created` is an opteryx
+# distinction between user and system commits that Iceberg does not draw.
+# None reads as "unknown" in the output, which is the truth.
+
+# opteryx column name -> Iceberg summary key. Identity for eight of nine; the
+# ninth is the removed/deleted spelling difference.
+_SUMMARY_KEY_MAP = {
+    "added-records": "added-records",
+    "added-data-files": "added-data-files",
+    "added-files-size": "added-files-size",
+    "deleted-records": "deleted-records",
+    "deleted-data-files": "deleted-data-files",
+    "deleted-files-size": "removed-files-size",
+    "total-records": "total-records",
+    "total-data-files": "total-data-files",
+    "total-files-size": "total-files-size",
+}
+
+
+def _summary_int(value: Any) -> int | None:
+    """An Iceberg summary counter as an int, or None if it is not readable."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+class IcebergSnapshot:
+    """One pyiceberg snapshot in the shape opteryx-core reads snapshots in.
+
+    Carries the pyiceberg snapshot's own identity fields through unchanged and
+    supplies the four opteryx fields Iceberg has no equivalent for as None.
+    `summary` is a plain dict keyed the way opteryx spells the counters, so
+    `normalize_snapshot`'s `summary.get(...)` lookups land.
+    """
+
+    __slots__ = (
+        "_snapshot",
+        "snapshot_id",
+        "parent_snapshot_id",
+        "sequence_number",
+        "timestamp_ms",
+        "schema_id",
+        "operation_type",
+        "author",
+        "user_created",
+        "commit_message",
+        "summary",
+    )
+
+    def __init__(self, snapshot: Any):
+        self._snapshot = snapshot
+        self.snapshot_id = snapshot.snapshot_id
+        self.parent_snapshot_id = snapshot.parent_snapshot_id
+        self.sequence_number = snapshot.sequence_number
+        self.timestamp_ms = snapshot.timestamp_ms
+        # `schema_id` is an INT in Iceberg and a VARCHAR column in opteryx's
+        # output (opteryx_catalog spells its schema ids as strings), so it is
+        # stringified here rather than at the vector builder, which would
+        # reject the int outright. Safe against the other reader of this
+        # attribute: `_resolve_snapshot` passes it to `IcebergDataset.schema`,
+        # which ignores the argument entirely and returns the table's current
+        # schema (Tier 1 has no historical-schema lookup).
+        self.schema_id = None if snapshot.schema_id is None else str(snapshot.schema_id)
+
+        summary = snapshot.summary
+        # `Summary.operation` is an `Operation` enum; the column is VARCHAR.
+        # `.value` gives the spec's lowercase name ("append", "overwrite", ...)
+        # rather than "Operation.APPEND".
+        operation = getattr(summary, "operation", None)
+        self.operation_type = getattr(operation, "value", operation)
+
+        # No Iceberg equivalent - see the module comment above.
+        self.author = None
+        self.user_created = None
+        self.commit_message = None
+
+        self.summary = {
+            column: _summary_int(summary.get(key) if summary is not None else None)
+            for column, key in _SUMMARY_KEY_MAP.items()
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"IcebergSnapshot(snapshot_id={self.snapshot_id})"
+
+
 class IcebergDataset(Dataset):
     # `_decode_bound` hands back what `from_bytes` decodes -- a real `str` for
     # a StringType column, a real `float` for a DoubleType -- not the ordinal
@@ -83,14 +206,26 @@ class IcebergDataset(Dataset):
         return self._table.metadata
 
     def snapshots(self) -> Iterable[Any]:
-        return self._table.snapshots()
+        """The full commit history, as IcebergSnapshot (see that class).
+
+        Order is pyiceberg's; opteryx-core sorts newest-first itself, so this
+        deliberately does not.
+        """
+        return [IcebergSnapshot(snap) for snap in self._table.snapshots()]
 
     def snapshot(self, snapshot_id: int | None = None) -> Any | None:
+        """One snapshot by id, or the current one. Also IcebergSnapshot.
+
+        Wrapped for the same reason `snapshots` is, and so that a caller
+        reading `.schema_id` off a targeted lookup and off the history sees one
+        type rather than two.
+        """
         if snapshot_id is None:
-            return self._table.current_snapshot()
+            current = self._table.current_snapshot()
+            return None if current is None else IcebergSnapshot(current)
         for snap in self._table.snapshots():
             if snap.snapshot_id == snapshot_id:
-                return snap
+                return IcebergSnapshot(snap)
         return None
 
     def schema(self, schema_id: str | None = None) -> RelationSchema | None:
