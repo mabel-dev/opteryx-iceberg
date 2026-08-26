@@ -21,9 +21,11 @@ from collections.abc import Iterable
 
 from opteryx_catalog.catalog.metastore import Metastore
 from opteryx_catalog.exceptions import DatasetNotFound
+from opteryx_catalog.exceptions import TagNotFound
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NoSuchNamespaceError
 from pyiceberg.exceptions import NoSuchTableError
+from pyiceberg.table.refs import SnapshotRefType
 
 from opteryx_iceberg.dataset import IcebergDataset
 from opteryx_iceberg.fileio import IcebergFileIO
@@ -84,11 +86,7 @@ class IcebergMetastore(Metastore):
         self.io = IcebergFileIO(properties)
 
     def load_dataset(self, identifier: str, load_history: bool = False) -> IcebergDataset:
-        try:
-            table = self._catalog.load_table(self._to_iceberg_identifier(identifier))
-        except (NoSuchTableError, NoSuchNamespaceError) as exc:
-            raise DatasetNotFound(identifier) from exc
-        return IcebergDataset(identifier, table)
+        return IcebergDataset(identifier, self._load_table(identifier))
 
     def load_view(self, identifier: str):
         # No Iceberg view-spec support in Tier 1. Callers (e.g.
@@ -171,6 +169,76 @@ class IcebergMetastore(Metastore):
         """Always empty - triggers are an opteryx concept with no Iceberg
         equivalent, so there is nothing an Iceberg catalog could report."""
         return []
+
+    # ------------------------------------------------------------------
+    # Tags.
+    #
+    # An Iceberg table keeps its tags in `metadata.refs` - the same map that
+    # holds its branches - so both methods below are answered from table
+    # metadata already fetched by `load_table`, with no extra round trip
+    # beyond that load.
+    #
+    # BRANCHES ARE DELIBERATELY EXCLUDED. the `tags` column of `SHOW SNAPSHOTS`
+    # answers "why is this snapshot still here", and opteryx has no branch
+    # concept to show one under; every Iceberg table also carries a `main`
+    # branch, which would otherwise appear as a tag on one row of every
+    # listing and read as something a user could time travel to by name.
+    # ------------------------------------------------------------------
+
+    def list_tags(self, identifier: str) -> list[dict]:
+        """Every tag on a table, as the plain dicts opteryx-core expects.
+
+        Same shape as `OpteryxCatalog.list_tags` - `name` and `snapshot-id`,
+        ordered by name - because `OpteryxConnector._snapshot_rows` groups on
+        `tag["snapshot-id"]` and prints `tag["name"]` without knowing which
+        catalog produced them.
+
+        Iceberg carries no per-tag creation time or author, so those keys are
+        absent rather than filled with a placeholder: a caller reading them
+        off a native-catalog tag would get a real value and here would get an
+        invention.
+        """
+        refs = self._load_table(identifier).metadata.refs
+        return sorted(
+            (
+                {"name": name, "snapshot-id": ref.snapshot_id}
+                for name, ref in refs.items()
+                if ref.snapshot_ref_type == SnapshotRefType.TAG
+            ),
+            key=lambda tag: tag["name"],
+        )
+
+    def resolve_tag(self, identifier: str, name: str) -> int:
+        """The snapshot id a tag names, or TagNotFound.
+
+        Matched EXACTLY as spelled. The native catalog lowercases tag names on
+        the way in, so `MyTag` and `mytag` are one tag there; an Iceberg ref
+        name is whatever the engine that wrote it stored, case included, and
+        is not opteryx's to normalize - lowercasing here would fail to
+        resolve a `Q1_2025` tag that plainly exists and is listed by
+        `SHOW SNAPSHOTS`.
+
+        A branch is not resolvable by this path (see the section comment), so
+        a branch name raises TagNotFound like any other name that is not a
+        tag: opteryx has no way to express "read this branch", and silently
+        answering with a branch head would be a different question answered.
+        """
+        ref = self._load_table(identifier).metadata.refs.get(name)
+        if ref is None or ref.snapshot_ref_type != SnapshotRefType.TAG:
+            raise TagNotFound(f"Tag not found: {name} on {identifier}")
+        return ref.snapshot_id
+
+    def _load_table(self, identifier: str):
+        """`load_table`, with pyiceberg's misses translated at the boundary.
+
+        The same translation `load_dataset` performs - kept in one place so a
+        tag lookup against a table that does not exist reports the missing
+        TABLE rather than a pyiceberg exception type.
+        """
+        try:
+            return self._catalog.load_table(self._to_iceberg_identifier(identifier))
+        except (NoSuchTableError, NoSuchNamespaceError) as exc:
+            raise DatasetNotFound(identifier) from exc
 
     def create_dataset(self, identifier: str, schema, properties=None, author=None):
         raise NotImplementedError(

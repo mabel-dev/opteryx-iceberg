@@ -246,10 +246,20 @@ class TestShowManifest:
     def test_the_bounds_are_the_real_decoded_iceberg_bounds(self, fixture):
         """Iceberg stores bounds as encoded BYTES. Seeing 1..3 and 4..7 here -
         the actual values of ROWS_V1/ROWS_V2 - is what proves they were
-        decoded, and it is the same statistic the engine prunes on."""
+        decoded, and it is the same statistic the engine prunes on.
+
+        They arrive as TEXT because SHOW MANIFEST renders min_values/max_values
+        that way for every source (opteryx.models.manifest_io._bound_as_text):
+        one row's bounds list holds one bound per field id, so a table whose
+        columns are not all one type puts a str and an int in the same ARRAY
+        column, which has one child type and cannot hold both. This table is
+        single-column INT64, so it would have survived typed - the rendering is
+        not conditional and neither is the assertion. What is asserted is
+        unchanged: 1..3 and 4..7, not the raw bytes Iceberg stored.
+        """
         result = rows(fixture["session"], f"SHOW MANIFEST FOR {TABLE}")
         bounds = sorted((r["min_values"][0], r["max_values"][0]) for r in result)
-        assert bounds == [(1, 3), (4, 7)]
+        assert bounds == [("1", "3"), ("4", "7")]
 
 
 @pytest.fixture(scope="module")
@@ -316,6 +326,102 @@ class TestShowSnapshotsAfterADelete:
     def test_the_table_reads_back_at_the_post_delete_count(self, deleted):
         session, table = deleted
         assert scalar(session, f"SELECT COUNT(*) FROM {table}") == 3
+
+
+@pytest.fixture(scope="module")
+def tagged(tmp_path_factory):
+    """A two-commit table with a TAG on the first commit and a BRANCH on it too.
+
+    Both refs live in the same `metadata.refs` map, which is why the branch is
+    here: it is what proves `list_tags` filters on ref TYPE rather than
+    returning every ref it finds. Every Iceberg table also carries a `main`
+    branch it never asked for, so a filter that is missing shows up as `main`
+    tagging the current snapshot of every table anyone lists.
+    """
+    workspace = "tttag"
+    root = tmp_path_factory.mktemp("iceberg-tt-tag")
+    warehouse = root / "warehouse"
+    warehouse.mkdir()
+    uri = f"sqlite:///{root / 'catalog.db'}"
+    warehouse_uri = f"file://{warehouse}"
+
+    writer = SqlCatalog(workspace, **{"uri": uri, "warehouse": warehouse_uri})
+    writer.create_namespace("ns")
+    table = writer.create_table("ns.t", schema=ROWS_V1.schema)
+    table.append(ROWS_V1)
+    first = table.current_snapshot().snapshot_id
+    table.append(ROWS_V2)
+
+    manage = table.manage_snapshots()
+    manage.create_tag(first, "release_one").commit()
+    table.manage_snapshots().create_branch(first, "wip").commit()
+
+    register_workspace(
+        workspace,
+        OpteryxConnector,
+        catalog=IcebergMetastore,
+        catalog_type="sql",
+        uri=uri,
+        warehouse=warehouse_uri,
+    )
+    return opteryx.session(user="tests"), f"{workspace}.ns.t", first
+
+
+class TestTags:
+    """SHOW SNAPSHOTS' tags column, and VERSION AS OF a tag.
+
+    Both were AttributeError before IcebergMetastore had `list_tags` /
+    `resolve_tag`: opteryx-core calls them on whatever catalog object the
+    workspace was registered with, and an Iceberg table keeps its tags in
+    `metadata.refs` rather than in a tags subcollection.
+    """
+
+    def test_the_tag_appears_against_the_snapshot_it_names(self, tagged):
+        session, table, first = tagged
+        result = rows(session, f"SHOW SNAPSHOTS FOR {table}")
+        by_id = {row["snapshot_id"]: row["tags"] for row in result}
+        assert by_id[first] == ["release_one"]
+
+    def test_an_untagged_snapshot_lists_no_tags(self, tagged):
+        session, table, first = tagged
+        result = rows(session, f"SHOW SNAPSHOTS FOR {table}")
+        others = [row["tags"] for row in result if row["snapshot_id"] != first]
+        assert others == [[]]
+
+    def test_branches_are_not_reported_as_tags(self, tagged):
+        """`main` and `wip` are refs on this table; neither is a tag."""
+        session, table, _ = tagged
+        every_tag = [
+            tag for row in rows(session, f"SHOW SNAPSHOTS FOR {table}") for tag in row["tags"]
+        ]
+        assert every_tag == ["release_one"]
+
+    def test_version_as_of_the_tag_reads_that_snapshot(self, tagged):
+        session, table, _ = tagged
+        sql = f"SELECT COUNT(*) FROM {table} VERSION AS OF 'release_one'"
+        assert scalar(session, sql) == V1_COUNT
+
+    def test_version_as_of_a_branch_name_is_an_error(self, tagged):
+        """A branch is not addressable by VERSION AS OF - opteryx has no way to
+        say 'read this branch', and answering with the branch head would be a
+        different question answered."""
+        session, table, _ = tagged
+        with pytest.raises(Exception):
+            rows(session, f"SELECT COUNT(*) FROM {table} VERSION AS OF 'wip'")
+
+    def test_version_as_of_an_unknown_tag_is_an_error(self, tagged):
+        session, table, _ = tagged
+        with pytest.raises(Exception):
+            rows(session, f"SELECT COUNT(*) FROM {table} VERSION AS OF 'no_such_tag'")
+
+    def test_a_tag_is_matched_as_spelled(self, tagged):
+        """The native catalog lowercases tag names on the way in; an Iceberg
+        ref name is whatever wrote it. Resolving `RELEASE_ONE` against a ref
+        named `release_one` would mean opteryx-iceberg normalizing names it
+        does not own."""
+        session, table, _ = tagged
+        with pytest.raises(Exception):
+            rows(session, f"SELECT COUNT(*) FROM {table} VERSION AS OF 'RELEASE_ONE'")
 
 
 class TestIcebergSnapshotAdapter:
