@@ -256,6 +256,10 @@ class TestShowManifest:
         single-column INT64, so it would have survived typed - the rendering is
         not conditional and neither is the assertion. What is asserted is
         unchanged: 1..3 and 4..7, not the raw bytes Iceberg stored.
+
+        opteryx-core 0.9.77-0.9.82 briefly shipped these columns as typed
+        ARRAY(VARIANT) instead; 0.9.83 restored the text rendering, and the
+        dependency floor excludes the typed range.
         """
         result = rows(fixture["session"], f"SHOW MANIFEST FOR {TABLE}")
         bounds = sorted((r["min_values"][0], r["max_values"][0]) for r in result)

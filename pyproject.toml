@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.8"
+version = "0.1.9"
 description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -56,7 +56,9 @@ test = [
     # tests/test_end_to_end_sql.py runs real SQL through the engine rather than
     # stopping at the Metastore surface, so the engine itself is a test-only
     # dependency. opteryx_iceberg's own code never imports opteryx.
-    "opteryx-core>=0.9.77",
+    # 0.9.77-0.9.82 rendered SHOW MANIFEST bounds as typed ARRAY(VARIANT);
+    # 0.9.83 restored the text rendering this package's tests assert on.
+    "opteryx-core>=0.9.83",
 ]
 
 [tool.setuptools.package-dir]
