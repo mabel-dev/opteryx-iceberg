@@ -133,3 +133,14 @@ def test_display_types_preserve_physical_width():
     assert _display_type(LongType()) == "INT64"
     assert _display_type(FloatType()) == "FLOAT32"
     assert _display_type(DoubleType()) == "FLOAT64"
+
+
+def test_binary_is_varbinary():
+    """Iceberg `binary` binds as VARBINARY - the type core's parquet reader gives
+    an unannotated BYTE_ARRAY column when it reads the file directly - so the
+    same file means the same thing through the catalog as without it."""
+    from pyiceberg.types import BinaryType
+
+    from opteryx_iceberg.dataset import _display_type
+
+    assert _display_type(BinaryType()) == "VARBINARY"

@@ -15,6 +15,7 @@ from opteryx_catalog.catalog.dataset import RelationSchema
 from opteryx_catalog.catalog.dataset import SchemaColumn
 from opteryx_catalog.catalog.metastore import Dataset
 from pyiceberg.conversions import from_bytes
+from pyiceberg.types import BinaryType
 from pyiceberg.types import BooleanType
 from pyiceberg.types import DateType
 from pyiceberg.types import DecimalType
@@ -52,6 +53,12 @@ _PRIMITIVE_TYPES = {
     TimestamptzType: "TIMESTAMP",
     StringType: "VARCHAR",
     UUIDType: "VARCHAR",
+    # Unannotated parquet BYTE_ARRAY (e.g. the canonical ClickBench hits.parquet
+    # text columns). VARBINARY is what core's parquet reader types the same
+    # column as when it reads the file directly, so a query means the same thing
+    # against the Iceberg table as against the file. Bounds decode via from_bytes
+    # to real `bytes`.
+    BinaryType: "VARBINARY",
 }
 
 
