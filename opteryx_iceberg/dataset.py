@@ -14,6 +14,7 @@ from opteryx_catalog.catalog.dataset import Datafile
 from opteryx_catalog.catalog.dataset import RelationSchema
 from opteryx_catalog.catalog.dataset import SchemaColumn
 from opteryx_catalog.catalog.metastore import Dataset
+from opteryx_catalog.exceptions import SnapshotMissingError
 from pyiceberg.conversions import from_bytes
 from pyiceberg.types import BinaryType
 from pyiceberg.types import BooleanType
@@ -203,6 +204,10 @@ class IcebergDataset(Dataset):
     # int64 keys opteryx-catalog's own stats builder writes. See the contract
     # on `Dataset.bounds_are_ordinal` for what mis-declaring this does.
     bounds_are_ordinal = False
+    # Iceberg's manifests are Avro, not the opteryx manifest parquet: planning
+    # reads this dataset through `scan()` rows. See the contract on
+    # `Dataset.has_opteryx_manifest`.
+    has_opteryx_manifest = False
 
     def __init__(self, identifier: str, table):
         self.identifier = identifier
@@ -234,6 +239,32 @@ class IcebergDataset(Dataset):
             if snap.snapshot_id == snapshot_id:
                 return IcebergSnapshot(snap)
         return None
+
+    def previous_user_snapshot(self) -> IcebergSnapshot | None:
+        """The snapshot `VERSION AS OF PREVIOUS` and the `previous` tag name.
+
+        On Iceberg this is the LITERAL PARENT of the current snapshot. The
+        native `SimpleDataset.previous_user_snapshot` walks past maintenance
+        commits (compaction, statistics refresh) to the previous version of the
+        DATA; this does not. Iceberg carries no `user_created`, so a parent that
+        is a `replace` commit (files rewritten, rows unchanged) is returned as
+        is, and PREVIOUS then reads the same data as an unqualified read.
+
+        None when the current snapshot has no parent (the first commit) or the
+        table has no snapshot. A parent id that names a snapshot the table no
+        longer retains (expired) raises, as the native walk does: there IS a
+        previous version, it just cannot be read, and None would say otherwise.
+        """
+        current = self.snapshot()
+        if current is None or current.parent_snapshot_id is None:
+            return None
+        parent = self.snapshot(current.parent_snapshot_id)
+        if parent is None:
+            raise SnapshotMissingError(
+                f"The version before snapshot {current.snapshot_id} of "
+                f"{self.identifier} has expired and can no longer be read."
+            )
+        return parent
 
     def schema(self, schema_id: str | int | None = None) -> RelationSchema | None:
         """The table's schema, or the historical schema `schema_id` names.

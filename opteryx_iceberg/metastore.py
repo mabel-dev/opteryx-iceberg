@@ -28,6 +28,7 @@ from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.table.refs import SnapshotRefType
 
 from opteryx_iceberg.dataset import IcebergDataset
+from opteryx_iceberg.fileio import PY_IO_IMPL
 from opteryx_iceberg.fileio import IcebergFileIO
 
 
@@ -82,7 +83,13 @@ class IcebergMetastore(Metastore):
                     '{"scopes": ["https://www.googleapis.com/auth/cloud-platform"]}}.'
                 )
         self.workspace = workspace
-        self._catalog = load_catalog(workspace, type=catalog_type, **properties)
+        # Iceberg metadata files (manifest lists, manifests, metadata.json) are
+        # read through opteryx-core's storage clients - one GET each, no HEAD,
+        # warm connections - rather than pyiceberg's default PyArrowFileIO; see
+        # opteryx_iceberg.fileio. A `py-io-impl` given in `properties` is the
+        # caller's explicit choice and replaces this one.
+        iceberg_properties = {"py-io-impl": PY_IO_IMPL, **properties}
+        self._catalog = load_catalog(workspace, type=catalog_type, **iceberg_properties)
         self.io = IcebergFileIO(properties)
 
     def load_dataset(self, identifier: str, load_history: bool = False) -> IcebergDataset:

@@ -380,17 +380,24 @@ class TestTags:
     `metadata.refs` rather than in a tags subcollection.
     """
 
+    # opteryx-core appends the VIRTUAL tags `current` and `previous` after a
+    # snapshot's real tags in SHOW SNAPSHOTS (opteryx_connector.get_snapshots).
+    # On Iceberg `previous` is the current snapshot's literal parent
+    # (IcebergDataset.previous_user_snapshot) - here, the tagged first commit.
+    VIRTUAL_TAGS = ("current", "previous")
+
     def test_the_tag_appears_against_the_snapshot_it_names(self, tagged):
         session, table, first = tagged
         result = rows(session, f"SHOW SNAPSHOTS FOR {table}")
         by_id = {row["snapshot_id"]: row["tags"] for row in result}
-        assert by_id[first] == ["release_one"]
+        assert by_id[first] == ["release_one", "previous"]
 
     def test_an_untagged_snapshot_lists_no_tags(self, tagged):
+        """The head carries no real tag - only the virtual `current`."""
         session, table, first = tagged
         result = rows(session, f"SHOW SNAPSHOTS FOR {table}")
         others = [row["tags"] for row in result if row["snapshot_id"] != first]
-        assert others == [[]]
+        assert others == [["current"]]
 
     def test_branches_are_not_reported_as_tags(self, tagged):
         """`main` and `wip` are refs on this table; neither is a tag."""
@@ -398,7 +405,7 @@ class TestTags:
         every_tag = [
             tag for row in rows(session, f"SHOW SNAPSHOTS FOR {table}") for tag in row["tags"]
         ]
-        assert every_tag == ["release_one"]
+        assert [tag for tag in every_tag if tag not in self.VIRTUAL_TAGS] == ["release_one"]
 
     def test_version_as_of_the_tag_reads_that_snapshot(self, tagged):
         session, table, _ = tagged

@@ -32,17 +32,16 @@ state they were left in:
      `strip_file_scheme` fixture) - that is there to keep any surviving
      wrong-answer failure visible and separately attributable, not to excuse it.
 
-  3. Still open, and visible in TestPredicatePruning: DECIMAL predicates give
-     wrong answers on some operators. `d = 3.30` and `d < 8.0` return 0 while
-     `d > 1.0` and `d >= 3.30` are right, which is the shape of a comparison
-     made against unscaled values. pyiceberg writes DECIMAL(9, 2) as a physical
-     INT32 with a Decimal annotation, where plain pyarrow writes
-     FIXED_LEN_BYTE_ARRAY(4); the same data through a plain parquet file
-     filters correctly, so the mishandling is the engine's INT32-backed decimal
-     path. Nothing this package declares can change the physical encoding, so
-     this one is not fixable here - the two `d = 3.30` cases carry a strict
-     xfail (see XFAIL_DECIMAL_EQUALITY) so the defect stays recorded and flips
-     loudly the day the engine fixes it.
+  3. FIXED (in the engine). DECIMAL predicates gave wrong answers on some
+     operators: `d = 3.30` and `d < 8.0` returned 0 while `d > 1.0` and
+     `d >= 3.30` were right - the shape of a comparison made against unscaled
+     values. The cause was row-group pruning, not the decimal decode: rugo's
+     statistics decoder (`decode_value`) returned an INT32/INT64 DECIMAL bound
+     as its raw unscaled integer (1.10 as 110), so `3.30 < 110` discarded the
+     row group. It only showed through a catalog because OpteryxConnector pushes
+     DECIMAL predicates into the scan and DiskConnector declines them, so a plain
+     parquet file of the same data never reached that comparison. The `d = 3.30`
+     cases carried a strict xfail until the engine fix flipped them to XPASS.
 
 Do not "fix" a failure here by relaxing an assertion: every expected value is
 hand-computed from ROWS below and is arithmetic, not observed behaviour.
@@ -102,36 +101,19 @@ PREDICATES = [
     ("b = false", 3, "BOOLEAN"),  # rows 2,4,6
     ("d > 4.0", 4, "DECIMAL"),  # 4.40,5.50,6.60,7.70
     ("d = 3.30", 1, "DECIMAL"),  # 3.30
+    # The bounds themselves. The literal is a float and the decoded bounds are
+    # exact Decimals: 7.70 as a float is 7.7000000000000001776, ABOVE the max,
+    # so a pruner comparing the raw float drops the row group holding it.
+    ("d = 7.70", 1, "DECIMAL"),  # 7.70 - the max
+    ("d >= 7.70", 1, "DECIMAL"),  # 7.70 - the max
+    ("d = 1.10", 1, "DECIMAL"),  # 1.10 - the min
+    ("d <= 1.10", 1, "DECIMAL"),  # 1.10 - the min
+    ("d < 8.0", 7, "DECIMAL"),  # all seven
+    ("d = 3.305", 0, "DECIMAL"),  # off the scale grid - matches nothing
 ]
 
-# Defect 3 (see the module docstring): DECIMAL equality against a pyiceberg-
-# written datafile returns 0 rows. pyiceberg writes DECIMAL(9, 2) as a physical
-# INT32 with a Decimal annotation, where plain pyarrow writes
-# FIXED_LEN_BYTE_ARRAY(4) - confirmed by reading both files' parquet schemas -
-# and only the INT32-backed form filters wrongly. Nothing opteryx-iceberg
-# declares chooses that encoding, so this is marked, not fixed.
-#
-# strict=True on purpose: if the engine starts answering this correctly the
-# test fails as XPASS, so the marker cannot outlive the defect in silence. The
-# expected value is untouched - 3.30 is in ROWS exactly once and the answer is
-# still 1.
-XFAIL_DECIMAL_EQUALITY = {"d = 3.30"}
-
-_DECIMAL_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "engine defect: DECIMAL equality over an INT32-backed decimal column "
-        "(the encoding pyiceberg writes) returns 0 rows"
-    ),
-)
-
 PREDICATE_PARAMS = [
-    pytest.param(
-        predicate,
-        expected,
-        id=f"{kind}-{predicate}",
-        marks=[_DECIMAL_XFAIL] if predicate in XFAIL_DECIMAL_EQUALITY else [],
-    )
+    pytest.param(predicate, expected, id=f"{kind}-{predicate}")
     for predicate, expected, kind in PREDICATES
 ]
 

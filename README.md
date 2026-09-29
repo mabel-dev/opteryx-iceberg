@@ -4,7 +4,9 @@ Read-only Apache Iceberg `Metastore`/`FileIO` backend for [opteryx-catalog](http
 
 This is Tier 1 of Opteryx's Iceberg support: **reads only**. Writing real Iceberg tables from Opteryx (Tier 2) and serving Opteryx's own catalog as an Iceberg REST endpoint (Tier 3) are separate, later work.
 
-Kept as its own package - not merged into `opteryx-catalog` or `opteryx-core` - because it depends on `pyiceberg`, which pulls in `pyarrow`/`pydantic`. Both of those repos are deliberately free of that dependency chain; Iceberg support is optional, the same way `opteryx-access` is.
+Kept as its own package - not merged into `opteryx-catalog` or `opteryx-core` - because it depends on `pyiceberg`, which pulls in `pydantic`. Both of those repos are deliberately free of that dependency chain; Iceberg support is optional, the same way `opteryx-access` is.
+
+Iceberg metadata files (manifest lists, manifests, `metadata.json`) are read through opteryx-core's own storage clients (`opteryx_iceberg.fileio.OpteryxFileIO`, installed as the catalog's `py-io-impl`), not pyiceberg's `PyArrowFileIO`: one GET per file with no preceding HEAD, over the engine's warm connections, and no `pyarrow` at runtime. Credentials and the S3 endpoint therefore come from opteryx-core's configuration; a catalog whose properties name a different S3 endpoint or access key, or vend a GCS token, is refused rather than silently read under another identity.
 
 ## Usage
 
@@ -73,11 +75,11 @@ If you already have a SQL catalog written under a different name, either registe
 ## What's supported
 
 - `SELECT` queries against existing Iceberg tables, including predicate pushdown/pruning via standard Iceberg manifest bounds (`min_values`/`max_values`/`null_counts`).
-- Schema introspection (`DESCRIBE`, information_schema).
+- Schema introspection (`SHOW COLUMNS`, information_schema).
 - Time travel: `VERSION AS OF <snapshot-id>`, `VERSION AS OF PREVIOUS` (walks Iceberg's `parent_snapshot_id`), and `TIMESTAMP AS OF '<ts>'` (point-in-time, resolved against the commit history; a timestamp before the first commit is an error, not an empty result).
 - `SHOW MANIFEST FOR <table>` — one row per live data file, with the real decoded Iceberg bounds.
 - `SHOW SNAPSHOTS FOR <table>` — the commit history, newest first.
-- `information_schema.tables` / `.columns`, and `SHOW COLUMNS` / `DESCRIBE`.
+- `information_schema.tables` / `.columns`, and `SHOW COLUMNS`. (`DESCRIBE` is not supported by opteryx-core for any table - it is rejected as an `EXPLAIN TABLE` query.)
 - Partitioned tables, including predicates over the partition column.
 - Schema evolution: a time-travel read resolves the *historical* schema the snapshot was written under, so a snapshot taken before an `ADD COLUMN` does not report the column that did not exist yet.
 
@@ -124,5 +126,5 @@ Snowflake Open Catalog is closed to new signups as of 2026 (Snowflake now points
 
 - Catalog: `projects/mabeldev/catalogs/opteryx-iceberg-tier1-test` (type `biglake`, credential-mode `end-user`), storing data under `gs://tarchia/iceberg-tier1-test`.
 - Verified manually (not in CI - needs a live GCP access token): `dataset_exists`, `load_dataset`, `schema()` type mapping, `scan()` including real Iceberg bounds-byte decoding (`min_values`/`max_values`/`field_ids`), and `get_relation` for both hit and miss, all through `opteryx_iceberg.IcebergMetastore` against a table (`interop_ns.people`) written independently via plain `pyiceberg.catalog.rest.RestCatalog`.
-- Connecting needs `GOOGLE_APPLICATION_CREDENTIALS` set in-process (not just `gcloud auth activate-service-account`) — `PyArrowFileIO`'s GCS backend otherwise hangs trying to reach the GCE metadata server for ADC. Warehouse URI format is `bl://projects/<project>/catalogs/<catalog>` (not a bare `projects/...` path).
+- Connecting needed `GOOGLE_APPLICATION_CREDENTIALS` set in-process (not just `gcloud auth activate-service-account`) — at the time metadata was read through `PyArrowFileIO`, whose GCS backend otherwise hung trying to reach the GCE metadata server for ADC. Metadata now reads through opteryx-core's GCS client; this check has not been re-run since. Warehouse URI format is `bl://projects/<project>/catalogs/<catalog>` (not a bare `projects/...` path).
 - This catalog/table is being kept around (not torn down) for reuse in future Tier 1/Tier 2 verification.

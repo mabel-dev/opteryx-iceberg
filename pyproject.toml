@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.10"
+version = "0.1.11"
 description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -31,10 +31,13 @@ dependencies = [
     # catches BY TYPE to translate a bad tag into a clean SQL error. That class
     # first ships in 0.4.111 (0.4.110 was never published), so an older catalog
     # would import-error on metastore.py rather than silently mis-report.
-    "opteryx-catalog>=0.4.174",
-    # IcebergFileIO (fileio.py) wraps pyiceberg's PyArrowFileIO unconditionally,
-    # so pyarrow is a hard runtime dependency here, not optional - pyiceberg
-    # itself only pulls it in behind the "pyarrow" extra.
+    "opteryx-catalog>=0.4.111",
+    # Metadata reads go through opteryx-core's storage clients (fileio.py), so
+    # the engine is a runtime dependency. 0.9.143 is the version this was built
+    # and verified against (it also reuses connections across batched reads).
+    "opteryx-core>=0.9.143",
+    # pyiceberg WITHOUT the "pyarrow" extra: fileio.OpteryxFileIO replaces
+    # PyArrowFileIO as the catalog's py-io-impl, so nothing here needs pyarrow.
     #
     # Pinned to the 0.12.0rc1 prerelease, not >=0.11,<1: 0.11.1 is the latest
     # STABLE release and it ships no cp314 wheel at all (checked PyPI's file
@@ -42,7 +45,7 @@ dependencies = [
     # (Python 3.14, deliberately built with no Rust/C toolchain, so there's no
     # fallback to a source build). 0.12.0rc1 is the first release with a cp314
     # wheel. Move to a stable >=0.12 once one ships.
-    "pyiceberg[pyarrow]==0.12.0rc1",
+    "pyiceberg==0.12.0rc1",
 ]
 
 [project.optional-dependencies]
@@ -53,12 +56,9 @@ test = [
     # imports it, so this stays out of the main dependency list. Pinned to
     # match the main dependency - see the note above.
     "pyiceberg[sql-sqlite]==0.12.0rc1",
-    # tests/test_end_to_end_sql.py runs real SQL through the engine rather than
-    # stopping at the Metastore surface, so the engine itself is a test-only
-    # dependency. opteryx_iceberg's own code never imports opteryx.
-    # 0.9.77-0.9.82 rendered SHOW MANIFEST bounds as typed ARRAY(VARIANT);
-    # 0.9.83 restored the text rendering this package's tests assert on.
-    "opteryx-core>=0.9.83",
+    # The test fixtures WRITE tables with pyiceberg's own PyArrowFileIO
+    # (pyarrow tables in, parquet out); opteryx_iceberg's code never does.
+    "pyarrow",
 ]
 
 [tool.setuptools.package-dir]
