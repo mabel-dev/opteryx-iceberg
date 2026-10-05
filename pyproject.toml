@@ -26,38 +26,15 @@ classifiers = [
 urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
 requires-python = ">=3.11"
 dependencies = [
-    # 0.4.111 is the floor, not 0.4.104: `resolve_tag` raises
-    # opteryx_catalog.exceptions.TagNotFound, which opteryx-core's connector
-    # catches BY TYPE to translate a bad tag into a clean SQL error. That class
-    # first ships in 0.4.111 (0.4.110 was never published), so an older catalog
-    # would import-error on metastore.py rather than silently mis-report.
-    "opteryx-catalog>=0.4.178",
-    # Metadata reads go through opteryx-core's storage clients (fileio.py), so
-    # the engine is a runtime dependency. 0.9.143 is the version this was built
-    # and verified against (it also reuses connections across batched reads).
+    "opteryx-catalog>=0.4.179",
     "opteryx-core>=0.9.155",
-    # pyiceberg WITHOUT the "pyarrow" extra: fileio.OpteryxFileIO replaces
-    # PyArrowFileIO as the catalog's py-io-impl, so nothing here needs pyarrow.
-    #
-    # Pinned to the 0.12.0rc1 prerelease, not >=0.11,<1: 0.11.1 is the latest
-    # STABLE release and it ships no cp314 wheel at all (checked PyPI's file
-    # listing directly - cp310 through cp313 only), which breaks worker.opteryx
-    # (Python 3.14, deliberately built with no Rust/C toolchain, so there's no
-    # fallback to a source build). 0.12.0rc1 is the first release with a cp314
-    # wheel. Move to a stable >=0.12 once one ships.
     "pyiceberg==0.12.0rc1",
 ]
 
 [project.optional-dependencies]
 test = [
     "pytest>=8",
-    # Only the test fixtures use pyiceberg's local SqlCatalog (SQLite +
-    # local-disk FileIO, no server) - opteryx_iceberg's own code never
-    # imports it, so this stays out of the main dependency list. Pinned to
-    # match the main dependency - see the note above.
     "pyiceberg[sql-sqlite]==0.12.0rc1",
-    # The test fixtures WRITE tables with pyiceberg's own PyArrowFileIO
-    # (pyarrow tables in, parquet out); opteryx_iceberg's code never does.
     "pyarrow",
 ]
 
