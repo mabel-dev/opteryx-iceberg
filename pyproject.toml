@@ -31,11 +31,11 @@ dependencies = [
     # catches BY TYPE to translate a bad tag into a clean SQL error. That class
     # first ships in 0.4.111 (0.4.110 was never published), so an older catalog
     # would import-error on metastore.py rather than silently mis-report.
-    "opteryx-catalog>=0.4.176",
+    "opteryx-catalog>=0.4.178",
     # Metadata reads go through opteryx-core's storage clients (fileio.py), so
     # the engine is a runtime dependency. 0.9.143 is the version this was built
     # and verified against (it also reuses connections across batched reads).
-    "opteryx-core>=0.9.146",
+    "opteryx-core>=0.9.155",
     # pyiceberg WITHOUT the "pyarrow" extra: fileio.OpteryxFileIO replaces
     # PyArrowFileIO as the catalog's py-io-impl, so nothing here needs pyarrow.
     #
