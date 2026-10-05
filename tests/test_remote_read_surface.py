@@ -103,9 +103,9 @@ class TestMergeOnReadIsRefused:
 
     def test_delete_files_on_a_task_refuse_the_scan(self, table, monkeypatch):
         session, name = table
-        original = IcebergDataset.scan
+        original = IcebergDataset._manifest_entries
 
-        def scan_with_deletes(self, *args, **kwargs):
+        def entries_with_deletes(self, *args, **kwargs):
             real_plan = self._table.scan
 
             def planned(*a, **k):
@@ -123,7 +123,7 @@ class TestMergeOnReadIsRefused:
             monkeypatch.setattr(self._table, "scan", planned)
             return original(self, *args, **kwargs)
 
-        monkeypatch.setattr(IcebergDataset, "scan", scan_with_deletes)
+        monkeypatch.setattr(IcebergDataset, "_manifest_entries", entries_with_deletes)
 
         with pytest.raises(Exception) as caught:
             rows(session, f"SELECT COUNT(*) FROM {name}")

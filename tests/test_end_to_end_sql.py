@@ -47,8 +47,6 @@ Do not "fix" a failure here by relaxing an assertion: every expected value is
 hand-computed from ROWS below and is arithmetic, not observed behaviour.
 """
 
-import importlib
-import logging
 from decimal import Decimal
 
 import pyarrow as pa
@@ -149,23 +147,24 @@ def session(tmp_path_factory):
 def strip_file_scheme(monkeypatch):
     """Neutralise defect 1 (and ONLY defect 1) for the duration of one test.
 
-    Strips any surviving "file://" scheme from what IcebergDataset.scan yields,
-    so the query reaches the parquet reader and whatever it then gets wrong is
-    a predicate-handling defect and nothing else. Now that scan normalises the
-    path itself this is a no-op on a healthy tree - it is kept so that a
-    regression in _reader_path shows up as a TestEndToEnd failure ONLY, leaving
-    TestPredicatePruning's attribution ("not the file:// scheme") true by
-    construction rather than by assumption.
+    Strips any surviving "file://" scheme from the manifest entries
+    IcebergDataset builds (`_manifest_entries`, behind both `scan` and
+    `manifest_bytes`), so the query reaches the parquet reader and whatever it
+    then gets wrong is a predicate-handling defect and nothing else. Now that the
+    entries normalise the path themselves this is a no-op on a healthy tree - it
+    is kept so that a regression in _reader_path shows up as a TestEndToEnd
+    failure ONLY, leaving TestPredicatePruning's attribution ("not the file://
+    scheme") true by construction rather than by assumption.
     """
-    original = IcebergDataset.scan
+    original = IcebergDataset._manifest_entries
 
-    def scan(self, *args, **kwargs):
-        for datafile in original(self, *args, **kwargs):
-            if datafile.file_path.startswith("file://"):
-                datafile.entry["file_path"] = datafile.file_path[len("file://") :]
-            yield datafile
+    def entries(self, *args, **kwargs):
+        for entry in original(self, *args, **kwargs):
+            if entry["file_path"].startswith("file://"):
+                entry["file_path"] = entry["file_path"][len("file://") :]
+            yield entry
 
-    monkeypatch.setattr(IcebergDataset, "scan", scan)
+    monkeypatch.setattr(IcebergDataset, "_manifest_entries", entries)
 
 
 def morsels(session, sql):
@@ -256,61 +255,3 @@ class TestPredicatePruning:
         the attribution above no longer holds.
         """
         assert row_count(session, f"SELECT * FROM {TABLE}") == ROW_COUNT
-
-
-class TestSketchVectors:
-    """IcebergDataset must ANSWER the sketch-vector probe, not be missing it.
-
-    opteryx-core's OpteryxTable does `getattr(self.table,
-    "manifest_sketch_vectors", None)` and, on None, logs a warning telling the
-    operator to upgrade opteryx_catalog. On an Iceberg workspace that advice is
-    unactionable - the absence is a property of the Iceberg spec, not of the
-    installed catalog version - so the accessor is defined here and returns the
-    empty dict that honestly describes an Iceberg manifest.
-
-    The warning is one-shot per process (a module global in opteryx-core), so a
-    regression would not be caught by a test that merely runs a second query -
-    it has to assert on the accessor itself and on the probe's outcome.
-    """
-
-    def test_accessor_is_present_and_empty(self):
-        dataset = IcebergDataset("ns.t", object())
-        # The exact probe opteryx-core performs must not come back None.
-        assert getattr(dataset, "manifest_sketch_vectors", None) is not None
-        assert dataset.manifest_sketch_vectors() == {}
-        assert dataset.manifest_sketch_vectors(snapshot_id=1234) == {}
-
-    def test_engine_does_not_flag_this_backend_as_lacking_sketches(
-        self, session, strip_file_scheme, caplog
-    ):
-        """A real query must not make opteryx-core report a missing accessor.
-
-        caplog alone is not enough: opteryx-core guards the report so a given
-        backend is announced only once, so by the time this test runs the guard
-        may already be tripped and the assertion would pass vacuously. Reset the
-        guard first, tolerating both shapes it has had - a process-wide bool in
-        opteryx-core <= 0.9.77, a per-backend-class set after - so this test
-        pins OUR behaviour and does not fail merely because core's internals
-        moved.
-        """
-        connector_module = importlib.import_module("opteryx.connectors.opteryx_connector")
-        guard = getattr(connector_module, "_warned_no_native_sketches", None)
-        assert guard is not None, (
-            "opteryx-core no longer guards the no-sketch-vectors report with "
-            "_warned_no_native_sketches; re-check how that path is reported "
-            "before trusting this test"
-        )
-        if isinstance(guard, set):
-            guard.clear()
-        else:
-            connector_module._warned_no_native_sketches = False
-
-        with caplog.at_level(logging.DEBUG):
-            list(session.execute_to_morsels(f"SELECT * FROM {TABLE}"))
-
-        reported = [r for r in caplog.records if "manifest_sketch_vectors" in r.getMessage()]
-        assert not reported, (
-            "opteryx-core took the no-native-sketches branch - "
-            "IcebergDataset.manifest_sketch_vectors is missing or not being found: "
-            f"{[r.getMessage() for r in reported]}"
-        )

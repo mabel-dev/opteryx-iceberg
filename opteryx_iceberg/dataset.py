@@ -155,6 +155,7 @@ class IcebergSnapshot:
         "sequence_number",
         "timestamp_ms",
         "schema_id",
+        "manifest_list",
         "operation_type",
         "author",
         "user_created",
@@ -168,6 +169,10 @@ class IcebergSnapshot:
         self.parent_snapshot_id = snapshot.parent_snapshot_id
         self.sequence_number = snapshot.sequence_number
         self.timestamp_ms = snapshot.timestamp_ms
+        # Iceberg's manifest list: written once per snapshot and never rewritten,
+        # so it names exactly one manifest - opteryx-core caches the decoded
+        # manifest under it (see IcebergDataset.manifest_bytes).
+        self.manifest_list = snapshot.manifest_list
         # `schema_id` is an INT in Iceberg and a VARCHAR column in opteryx's
         # output (opteryx_catalog spells its schema ids as strings), so it is
         # stringified here rather than at the vector builder, which would
@@ -199,15 +204,11 @@ class IcebergSnapshot:
 
 
 class IcebergDataset(Dataset):
-    # `_decode_bound` hands back what `from_bytes` decodes -- a real `str` for
-    # a StringType column, a real `float` for a DoubleType -- not the ordinal
-    # int64 keys opteryx-catalog's own stats builder writes. See the contract
-    # on `Dataset.bounds_are_ordinal` for what mis-declaring this does.
-    bounds_are_ordinal = False
-    # Iceberg's manifests are Avro, not the opteryx manifest parquet: planning
-    # reads this dataset through `scan()` rows. See the contract on
-    # `Dataset.has_opteryx_manifest`.
-    has_opteryx_manifest = False
+    # Iceberg's lower/upper bounds are converted to the ordinal int64 keys
+    # opteryx-catalog's own stats builder writes (`_ordinal_bound`), so the
+    # manifest this serves is the opteryx manifest parquet. See the contract on
+    # `Dataset.bounds_are_ordinal` for what mis-declaring this does.
+    bounds_are_ordinal = True
 
     def __init__(self, identifier: str, table):
         self.identifier = identifier
@@ -307,7 +308,27 @@ class IcebergDataset(Dataset):
     def scan(
         self, row_filter=None, snapshot_id: int | None = None, row_limit: int | None = None
     ) -> Iterable[Datafile]:
+        for entry in self._manifest_entries(snapshot_id):
+            yield Datafile(entry=entry)
+
+    def manifest_bytes(self, snapshot_id: int | None = None) -> bytes | None:
+        """The snapshot's files as the opteryx manifest parquet (see
+        `Dataset.manifest_bytes`), built from Iceberg's own manifests. Built on
+        every call: opteryx-core caches the decoded manifest by the snapshot's
+        `manifest_list` (Iceberg's manifest list, written once per snapshot), so
+        this runs once per snapshot per process, not once per query."""
+        from opteryx_catalog.catalog.manifest import encode_parquet_manifest
+
+        snap = self.snapshot(snapshot_id)
+        if snap is None or not snap.manifest_list:
+            return None
+        return encode_parquet_manifest(list(self._manifest_entries(snap.snapshot_id)))
+
+    def _manifest_entries(self, snapshot_id: int | None) -> Iterable[dict]:
+        """One opteryx manifest entry per data file of the snapshot: counts,
+        sizes, and per field id the ordinal min/max bound and null count."""
         iceberg_schema = self._table.schema()
+        column_type_by_id = {f.field_id: _column_type(f.field_type) for f in iceberg_schema.fields}
         field_by_id = {f.field_id: f for f in iceberg_schema.fields}
 
         table_scan = self._table.scan(snapshot_id=snapshot_id)
@@ -318,49 +339,28 @@ class IcebergDataset(Dataset):
                 set(data_file.lower_bounds or {}) | set(data_file.upper_bounds or {})
             )
             min_values = [
-                _decode_bound(data_file.lower_bounds, fid, field_by_id) for fid in field_ids
+                _ordinal_bound(data_file.lower_bounds, fid, field_by_id, column_type_by_id)
+                for fid in field_ids
             ]
             max_values = [
-                _decode_bound(data_file.upper_bounds, fid, field_by_id) for fid in field_ids
+                _ordinal_bound(data_file.upper_bounds, fid, field_by_id, column_type_by_id)
+                for fid in field_ids
             ]
             null_counts = [
                 (data_file.null_value_counts or {}).get(fid) for fid in field_ids
             ]
-            yield Datafile(
-                entry={
-                    "file_path": _reader_path(data_file.file_path),
-                    "record_count": data_file.record_count,
-                    "file_size_in_bytes": data_file.file_size_in_bytes,
-                    "field_ids": field_ids,
-                    "min_values": min_values,
-                    "max_values": max_values,
-                    "null_counts": null_counts,
-                    # No min_k_hashes/histogram_counts - Iceberg manifests
-                    # carry no equivalent sketch stats. opteryx-core's
-                    # pruning already falls back cleanly to "no sketches".
-                }
-            )
-
-    def manifest_sketch_vectors(self, snapshot_id: int | None = None) -> dict:
-        """Always empty: Iceberg manifests carry no sketch columns.
-
-        opteryx-core probes for this accessor with `getattr(table, ...)` and
-        treats its absence as "the catalog is too old to expose native sketch
-        vectors", logging a warning that tells the operator to upgrade
-        opteryx_catalog. For an Iceberg-backed workspace that advice is
-        unactionable - no version of opteryx_catalog puts NDV/histogram
-        sketches into an Iceberg manifest, because the Iceberg spec has no
-        field to hold them (see `scan`, which likewise emits no
-        min_k_hashes/histogram_counts).
-
-        `{}` is not a stub to silence the warning - it is the accessor's own
-        answer for "this snapshot has no sketch columns", identical to what
-        opteryx_catalog returns for a snapshot with no manifest, and identical
-        to the value opteryx-core's fallback branch assigns anyway. Defining it
-        changes no query result; it only stops the engine from misreporting an
-        inherent property of the format as a stale dependency.
-        """
-        return {}
+            yield {
+                "file_path": _reader_path(data_file.file_path),
+                "file_format": "parquet",
+                "record_count": data_file.record_count,
+                "file_size_in_bytes": data_file.file_size_in_bytes,
+                "field_ids": field_ids,
+                "min_values": min_values,
+                "max_values": max_values,
+                "null_counts": null_counts,
+                # No min_k_hashes/histogram_counts - Iceberg manifests
+                # carry no equivalent sketch stats.
+            }
 
     def append(self, table):
         raise NotImplementedError(
@@ -431,10 +431,33 @@ def _reader_path(file_path: str) -> str:
     return unquote(parsed.path)
 
 
-def _decode_bound(bounds: dict | None, field_id: int, field_by_id: dict) -> Any:
+def _column_type(field_type: Any) -> Any:
+    """The ColumnType opteryx-core binds an Iceberg column to (or None for a type
+    `_display_type` does not map, whose bounds are then left out)."""
+    from opteryx.types.logical_type import try_parse_column_type
+
+    if isinstance(field_type, UUIDType):
+        # pyiceberg decodes a UUID bound to a `uuid.UUID`, which has no ordinal
+        # in the VARCHAR space the column is bound to: no bound (no statistics
+        # is slower, never wrong).
+        return None
+    for iceberg_type in (*_PRIMITIVE_TYPES, DecimalType):
+        if isinstance(field_type, iceberg_type):
+            return try_parse_column_type(_display_type(field_type))
+    return None
+
+
+def _ordinal_bound(
+    bounds: dict | None, field_id: int, field_by_id: dict, column_type_by_id: dict
+) -> int | None:
+    """Iceberg's encoded bound for `field_id` as the ordinal key opteryx-core
+    compares predicate literals against - through the same
+    `ColumnType.ordinalize` it ordinalizes those literals with. None when there
+    is no bound, or the column has no ordinal."""
     if not bounds or field_id not in bounds:
         return None
     field = field_by_id.get(field_id)
-    if field is None:
+    column_type = column_type_by_id.get(field_id)
+    if field is None or column_type is None:
         return None
-    return from_bytes(field.field_type, bounds[field_id])
+    return column_type.ordinalize(from_bytes(field.field_type, bounds[field_id]))

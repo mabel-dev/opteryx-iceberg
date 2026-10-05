@@ -457,6 +457,7 @@ class TestIcebergSnapshotAdapter:
                     "sequence_number": 1,
                     "timestamp_ms": 0,
                     "schema_id": 3,
+                    "manifest_list": None,
                     "summary": FakeSummary({"added-records": "not-a-number"}),
                 },
             )()
