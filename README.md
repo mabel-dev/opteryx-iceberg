@@ -8,6 +8,8 @@ Kept as its own package - not merged into `opteryx-catalog` or `opteryx-core` - 
 
 Iceberg metadata files (manifest lists, manifests, `metadata.json`) are read through opteryx-core's own storage clients (`opteryx_iceberg.fileio.OpteryxFileIO`, installed as the catalog's `py-io-impl`), not pyiceberg's `PyArrowFileIO`: one GET per file with no preceding HEAD, over the engine's warm connections, and no `pyarrow` at runtime. Credentials and the S3 endpoint therefore come from opteryx-core's configuration; a catalog whose properties name a different S3 endpoint or access key, or vend a GCS token, is refused rather than silently read under another identity.
 
+Manifest lists and manifests are decoded by rugo's native Avro reader (bundled in opteryx-core), not pyiceberg: `opteryx_iceberg.manifests` replaces `table.scan().plan_files()`, making the same decisions pyiceberg's local planner makes with no row filter (live entries, sequence-number inheritance, delete-file matching), and is tested against it. pyiceberg remains the catalog client - `metadata.json`, snapshots and schemas. Planning is always local: a REST catalog configured for server-side scan planning is not asked for a plan.
+
 ## Usage
 
 Register a workspace against an external Iceberg catalog using Opteryx's existing connector-registration API:

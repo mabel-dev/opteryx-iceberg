@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.15"
+version = "0.1.16"
 description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -27,7 +27,7 @@ urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
 requires-python = ">=3.11"
 dependencies = [
     "opteryx-catalog>=0.4.180",
-    "opteryx-core>=0.9.160",
+    "opteryx-core>=0.9.166",
     "pyiceberg==0.12.0rc1",
 ]
 

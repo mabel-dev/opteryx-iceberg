@@ -14,7 +14,7 @@ auditing against a real catalog, not by reading code:
      path ("Merge on read is not yet supported, falling back to copy-on-write"),
      so no local fixture can produce the condition and no local test would ever
      have caught it. The engines that write remote catalogs all can. `scan` now
-     refuses such a table; see `_reject_merge_on_read`.
+     refuses such a table; see `opteryx_iceberg.manifests`.
 
   2. TIME TRAVEL REPORTED TODAY'S COLUMNS. `schema()` ignored the schema_id it
      was handed and always returned the table's current schema, so reading a
@@ -29,17 +29,18 @@ auditing against a real catalog, not by reading code:
      `DatasetNotFound: 'ns.ns.t'`.
 """
 
+import opteryx
 import pyarrow as pa
 import pytest
+from _synthetic_deletes import commit
+from _synthetic_deletes import delete_file
+from _synthetic_deletes import snapshot_with_deletes
+from opteryx.connectors import register_workspace
+from opteryx.connectors.opteryx_connector import OpteryxConnector
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.types import StringType
 
-import opteryx
-from opteryx.connectors import register_workspace
-from opteryx.connectors.opteryx_connector import OpteryxConnector
-
 from opteryx_iceberg import IcebergMetastore
-from opteryx_iceberg.dataset import IcebergDataset
 
 
 def _catalog(tmp_path, workspace):
@@ -82,48 +83,36 @@ def scalar(session, sql):
 class TestMergeOnReadIsRefused:
     """The guard, driven by a SYNTHETIC delete file.
 
-    pyiceberg cannot write one (see the module docstring), so the scan task is
-    given delete files directly. That is the whole condition the guard tests
-    for - `plan_files` yielding a task whose `delete_files` is non-empty - and
-    it is what a Spark-written merge-on-read table produces.
+    pyiceberg cannot write one (see the module docstring), so a delete manifest
+    is written with pyiceberg's own manifest writer and committed as the
+    table's current snapshot (tests/_synthetic_deletes.py) - the shape a
+    Spark-written merge-on-read table has. Which deletes apply is covered
+    against pyiceberg's planner in tests/test_manifest_planning.py; this is the
+    refusal reaching a query.
     """
 
     @pytest.fixture
     def table(self, tmp_path):
         catalog, uri, warehouse_uri = _catalog(tmp_path, "mor")
         data = pa.table({"i": pa.array([1, 2, 3, 4, 5, 6], pa.int64())})
-        catalog.create_table("ns.t", schema=data.schema).append(data)
-        return _register("mor", uri, warehouse_uri), "mor.ns.t"
+        iceberg_table = catalog.create_table(
+            "ns.t", schema=data.schema, properties={"format-version": "2"}
+        )
+        iceberg_table.append(data)
+        return _register("mor", uri, warehouse_uri), "mor.ns.t", iceberg_table
 
     def test_a_copy_on_write_table_still_reads(self, table):
         """The guard must not fire on the ordinary case - every table
-        pyiceberg writes has empty delete_files."""
-        session, name = table
+        pyiceberg writes has no delete files."""
+        session, name, _ = table
         assert scalar(session, f"SELECT COUNT(*) FROM {name}") == 6
 
-    def test_delete_files_on_a_task_refuse_the_scan(self, table, monkeypatch):
-        session, name = table
-        original = IcebergDataset._manifest_entries
-
-        def entries_with_deletes(self, *args, **kwargs):
-            real_plan = self._table.scan
-
-            def planned(*a, **k):
-                table_scan = real_plan(*a, **k)
-
-                class _Tasks:
-                    def plan_files(inner):
-                        for task in table_scan.plan_files():
-                            # A positional delete file, as Spark would commit.
-                            task.delete_files = frozenset({"delete-0001.parquet"})
-                            yield task
-
-                return _Tasks()
-
-            monkeypatch.setattr(self._table, "scan", planned)
-            return original(self, *args, **kwargs)
-
-        monkeypatch.setattr(IcebergDataset, "_manifest_entries", entries_with_deletes)
+    def test_delete_files_refuse_the_scan(self, table):
+        session, name, iceberg_table = table
+        commit(
+            iceberg_table,
+            snapshot_with_deletes(iceberg_table, [(delete_file("delete-0001.parquet", ()), None)]),
+        )
 
         with pytest.raises(Exception) as caught:
             rows(session, f"SELECT COUNT(*) FROM {name}")
@@ -132,13 +121,6 @@ class TestMergeOnReadIsRefused:
         # The failure must name the cause, not just fail: an operator seeing
         # this needs to know the table is unsupported, not that opteryx broke.
         assert "deleted rows as live data" in message
-
-    def test_the_guard_says_nothing_when_delete_files_are_empty(self, table):
-        """An empty (not absent) delete_files set is the copy-on-write case and
-        must pass - guarding on presence of the attribute rather than on its
-        contents would refuse every table."""
-        session, name = table
-        assert scalar(session, f"SELECT COUNT(*) FROM {name}") == 6
 
 
 @pytest.fixture(scope="module")
@@ -230,3 +212,34 @@ class TestCatalogListingSurface:
         result = rows(session, "SELECT * FROM meta.information_schema.columns")
         assert sorted({r["table_name"] for r in result}) == ["t", "u", "v"]
         assert all(r["column_name"] == "a" for r in result)
+
+
+class TestWideDecimalColumns:
+    """A decimal wider than 18 digits (DECIMAL128) has no ordinal bound, so its
+    Iceberg bounds are skipped. That used to fail the whole scan; it must now
+    read, with predicates on the column answered from the data."""
+
+    @pytest.fixture
+    def table(self, tmp_path):
+        from decimal import Decimal
+
+        catalog, uri, warehouse_uri = _catalog(tmp_path, "wide")
+        data = pa.table(
+            {
+                "w": pa.array(
+                    [Decimal("1.25"), Decimal("-9.50"), Decimal("123456789012345678901.00")],
+                    pa.decimal128(30, 2),
+                ),
+                "n": pa.array([1, 2, 3], pa.int64()),
+            }
+        )
+        catalog.create_table("ns.t", schema=data.schema).append(data)
+        return _register("wide", uri, warehouse_uri), "wide.ns.t"
+
+    def test_reads(self, table):
+        session, name = table
+        assert scalar(session, f"SELECT COUNT(*) FROM {name}") == 3
+
+    def test_predicate_on_the_wide_decimal(self, table):
+        session, name = table
+        assert scalar(session, f"SELECT COUNT(*) FROM {name} WHERE w > 0") == 2

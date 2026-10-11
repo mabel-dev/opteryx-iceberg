@@ -10,12 +10,12 @@ from typing import Any
 from urllib.parse import unquote
 from urllib.parse import urlparse
 
+from draken.draken_native import DrakenType
 from opteryx_catalog.catalog.dataset import Datafile
 from opteryx_catalog.catalog.dataset import RelationSchema
 from opteryx_catalog.catalog.dataset import SchemaColumn
 from opteryx_catalog.catalog.metastore import Dataset
 from opteryx_catalog.exceptions import SnapshotMissingError
-from pyiceberg.conversions import from_bytes
 from pyiceberg.types import BinaryType
 from pyiceberg.types import BooleanType
 from pyiceberg.types import DateType
@@ -28,6 +28,8 @@ from pyiceberg.types import StringType
 from pyiceberg.types import TimestampType
 from pyiceberg.types import TimestamptzType
 from pyiceberg.types import UUIDType
+
+from opteryx_iceberg.manifests import plan_data_files
 
 # Iceberg primitive -> Opteryx display type string, the vocabulary
 # opteryx.types.logical_type.try_parse_column_type accepts (see
@@ -57,8 +59,7 @@ _PRIMITIVE_TYPES = {
     # Unannotated parquet BYTE_ARRAY (e.g. the canonical ClickBench hits.parquet
     # text columns). VARBINARY is what core's parquet reader types the same
     # column as when it reads the file directly, so a query means the same thing
-    # against the Iceberg table as against the file. Bounds decode via from_bytes
-    # to real `bytes`.
+    # against the Iceberg table as against the file. Bounds are the raw bytes.
     BinaryType: "VARBINARY",
 }
 
@@ -326,38 +327,35 @@ class IcebergDataset(Dataset):
 
     def _manifest_entries(self, snapshot_id: int | None) -> Iterable[dict]:
         """One opteryx manifest entry per data file of the snapshot: counts,
-        sizes, and per field id the ordinal min/max bound and null count."""
-        iceberg_schema = self._table.schema()
-        column_type_by_id = {f.field_id: _column_type(f.field_type) for f in iceberg_schema.fields}
-        field_by_id = {f.field_id: f for f in iceberg_schema.fields}
+        sizes, and per field id the ordinal min/max bound and null count.
 
-        table_scan = self._table.scan(snapshot_id=snapshot_id)
-        for task in table_scan.plan_files():
-            _reject_merge_on_read(task, self.identifier)
-            data_file = task.file
-            field_ids = sorted(
-                set(data_file.lower_bounds or {}) | set(data_file.upper_bounds or {})
-            )
-            min_values = [
-                _ordinal_bound(data_file.lower_bounds, fid, field_by_id, column_type_by_id)
-                for fid in field_ids
-            ]
-            max_values = [
-                _ordinal_bound(data_file.upper_bounds, fid, field_by_id, column_type_by_id)
-                for fid in field_ids
-            ]
-            null_counts = [
-                (data_file.null_value_counts or {}).get(fid) for fid in field_ids
-            ]
+        The snapshot's manifest list and manifests are read with rugo's Avro
+        reader (`opteryx_iceberg.manifests`), not pyiceberg's `plan_files()`."""
+        metadata = self._table.metadata
+        snapshot = (
+            metadata.current_snapshot()
+            if snapshot_id is None
+            else metadata.snapshot_by_id(snapshot_id)
+        )
+        if snapshot is None:
+            return
+        iceberg_schema = self._table.schema()
+        ordinal_types = {}
+        for field in iceberg_schema.fields:
+            column_type = _column_type(field.field_type)
+            if column_type is not None:
+                ordinal_types[field.field_id] = column_type.physical
+
+        for data_file in plan_data_files(self._table.io, snapshot, self.identifier, ordinal_types):
             yield {
                 "file_path": _reader_path(data_file.file_path),
                 "file_format": "parquet",
                 "record_count": data_file.record_count,
                 "file_size_in_bytes": data_file.file_size_in_bytes,
-                "field_ids": field_ids,
-                "min_values": min_values,
-                "max_values": max_values,
-                "null_counts": null_counts,
+                "field_ids": data_file.field_ids,
+                "min_values": data_file.min_values,
+                "max_values": data_file.max_values,
+                "null_counts": data_file.null_counts,
                 # No min_k_hashes/histogram_counts - Iceberg manifests
                 # carry no equivalent sketch stats.
             }
@@ -365,42 +363,6 @@ class IcebergDataset(Dataset):
     def append(self, table):
         raise NotImplementedError(
             "opteryx-iceberg (Tier 1) is read-only - writing is Tier 2 scope."
-        )
-
-
-def _reject_merge_on_read(task: Any, identifier: str) -> None:
-    """Refuse a scan task carrying Iceberg delete files.
-
-    Iceberg v2 has two ways to express a delete. COPY-ON-WRITE rewrites the
-    data file without the deleted rows, and the rows are simply gone - that is
-    what pyiceberg itself writes, and it needs nothing from us. MERGE-ON-READ
-    instead leaves the data file alone and commits a DELETE FILE beside it
-    (positional: "rows 3 and 7 of this file are dead"; equality: "any row where
-    id = 42 is dead"), and the reader is required to subtract them at scan
-    time.
-
-    This package does not do that subtraction. Handing the data file over as-is
-    would return every deleted row as live data - the wrong answer, silently,
-    with no error and nothing in the result to hint at it. Refusing is strictly
-    better: a query that fails is a query nobody acts on.
-
-    This is NOT reachable from a table pyiceberg wrote. pyiceberg has no
-    merge-on-read write path at all ("Merge on read is not yet supported,
-    falling back to copy-on-write"), so the local SqlCatalog suite cannot
-    construct the condition - which is exactly why the guard is here rather
-    than left to be noticed. Spark, Flink and Trino DO write merge-on-read
-    deletes, and a remote catalog is usually one of those writing.
-
-    Lifting this means implementing delete application (positional and
-    equality), which is a different and much larger piece of work.
-    """
-    delete_files = getattr(task, "delete_files", None)
-    if delete_files:
-        raise NotImplementedError(
-            f"opteryx-iceberg (Tier 1, read-only) cannot read {identifier!r}: it "
-            f"has merge-on-read delete files ({len(delete_files)} on one data "
-            "file), and reading it without applying them would return deleted "
-            "rows as live data. Only copy-on-write tables are supported."
         )
 
 
@@ -433,7 +395,9 @@ def _reader_path(file_path: str) -> str:
 
 def _column_type(field_type: Any) -> Any:
     """The ColumnType opteryx-core binds an Iceberg column to (or None for a type
-    `_display_type` does not map, whose bounds are then left out)."""
+    `_display_type` does not map, whose bounds are then left out). Its physical
+    type decides how the column's Iceberg bounds are turned into ordinal keys
+    (opteryx-core src/cpp/planner/iceberg_bounds.hpp)."""
     from opteryx.types.logical_type import try_parse_column_type
 
     if isinstance(field_type, UUIDType):
@@ -443,21 +407,12 @@ def _column_type(field_type: Any) -> Any:
         return None
     for iceberg_type in (*_PRIMITIVE_TYPES, DecimalType):
         if isinstance(field_type, iceberg_type):
-            return try_parse_column_type(_display_type(field_type))
+            column_type = try_parse_column_type(_display_type(field_type))
+            if column_type.physical == DrakenType.DECIMAL128:
+                # A decimal wider than 18 digits: draken has no ordinal key for
+                # DECIMAL128, so its bounds are left out rather than failing the
+                # scan - no pruning on the column, never a wrong answer.
+                return None
+            return column_type
     return None
 
-
-def _ordinal_bound(
-    bounds: dict | None, field_id: int, field_by_id: dict, column_type_by_id: dict
-) -> int | None:
-    """Iceberg's encoded bound for `field_id` as the ordinal key opteryx-core
-    compares predicate literals against - through the same
-    `ColumnType.ordinalize` it ordinalizes those literals with. None when there
-    is no bound, or the column has no ordinal."""
-    if not bounds or field_id not in bounds:
-        return None
-    field = field_by_id.get(field_id)
-    column_type = column_type_by_id.get(field_id)
-    if field is None or column_type is None:
-        return None
-    return column_type.ordinalize(from_bytes(field.field_type, bounds[field_id]))
