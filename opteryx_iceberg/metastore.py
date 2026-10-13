@@ -33,6 +33,12 @@ from opteryx_iceberg.fileio import IcebergFileIO
 
 
 class IcebergMetastore(Metastore):
+    # The workspace's opteryx catalog entry holds only a LISTING of each
+    # Iceberg table (name and columns, no snapshot, no files); the table itself
+    # is read from Iceberg. Declared explicitly rather than inherited - see
+    # `Metastore.serves_catalog_records`.
+    serves_catalog_records: bool = False
+
     def __init__(
         self,
         workspace: str,
