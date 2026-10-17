@@ -18,14 +18,21 @@
 # every read would be (correctly) refused. On the host network both are
 # localhost:9000, so the profile endpoint and AWS_S3_ENDPOINT are one string.
 #
-# Two warehouses, both with STS off (every client reads with its own key - here
-# the same static key the warehouses hold):
-#   LAKEKEEPER_WAREHOUSE          remote signing off: a table load serves only
-#                                 the S3 endpoint/region/path-style.
+# Four warehouses, all on the one Silo:
+#   LAKEKEEPER_WAREHOUSE          STS and remote signing off: a table load
+#                                 serves only the S3 endpoint/region/path-style;
+#                                 every client reads with its own key (here the
+#                                 same static key the warehouse holds).
 #   LAKEKEEPER_DEFAULT_WAREHOUSE  Lakekeeper's default, remote signing on: a
 #                                 table load also serves a signer and
 #                                 `py-io-impl: FsspecFileIO`, which pyiceberg
 #                                 lets override the catalog's own FileIO.
+#   LAKEKEEPER_ENDPOINT_MISMATCH_WAREHOUSE
+#                                 profile endpoint http://127.0.0.1:9000 - the
+#                                 same server, a different string from
+#                                 AWS_S3_ENDPOINT: opteryx-iceberg must refuse.
+#   LAKEKEEPER_STS_WAREHOUSE      STS on: a table load vends temporary keys that
+#                                 differ from opteryx-core's: must refuse.
 
 set -euo pipefail
 
@@ -59,6 +66,7 @@ wait_for() {
 up() {
     : "${LAKEKEEPER_URI:?load scripts/lakekeeper.env first}"
     : "${LAKEKEEPER_WAREHOUSE:?}" "${LAKEKEEPER_DEFAULT_WAREHOUSE:?}" "${LAKEKEEPER_BUCKET:?}"
+    : "${LAKEKEEPER_ENDPOINT_MISMATCH_WAREHOUSE:?}" "${LAKEKEEPER_STS_WAREHOUSE:?}"
     : "${AWS_S3_ENDPOINT:?}"
     : "${AWS_ACCESS_KEY_ID:?}" "${AWS_SECRET_ACCESS_KEY:?}" "${AWS_REGION:?}"
 
@@ -95,15 +103,23 @@ up() {
         --data '{"accept-terms-of-use": true}'
     echo
 
-    # Remote signing off: a table load serves the endpoint only.
-    create_warehouse "$LAKEKEEPER_WAREHOUSE" lakekeeper ', "remote-signing-enabled": false'
-    # Lakekeeper's DEFAULT (remote signing on): a table load also serves a
-    # signer and `py-io-impl: FsspecFileIO` - the case opteryx-iceberg must
-    # not let replace its own FileIO.
-    create_warehouse "$LAKEKEEPER_DEFAULT_WAREHOUSE" lakekeeper-default ''
+    local unsigned=', "sts-enabled": false, "remote-signing-enabled": false'
+    create_warehouse "$LAKEKEEPER_WAREHOUSE" lakekeeper "$AWS_S3_ENDPOINT" "$unsigned"
+    create_warehouse "$LAKEKEEPER_DEFAULT_WAREHOUSE" lakekeeper-default "$AWS_S3_ENDPOINT" \
+        ', "sts-enabled": false'
+
+    local other_endpoint="${AWS_S3_ENDPOINT/localhost/127.0.0.1}"
+    if [ "$other_endpoint" = "$AWS_S3_ENDPOINT" ]; then
+        echo "ERROR: AWS_S3_ENDPOINT must name localhost so the mismatch warehouse differs" >&2
+        return 1
+    fi
+    create_warehouse "$LAKEKEEPER_ENDPOINT_MISMATCH_WAREHOUSE" lakekeeper-endpoint \
+        "$other_endpoint" "$unsigned"
+    create_warehouse "$LAKEKEEPER_STS_WAREHOUSE" lakekeeper-sts "$AWS_S3_ENDPOINT" \
+        ", \"sts-enabled\": true, \"sts-endpoint\": \"$AWS_S3_ENDPOINT\", \"remote-signing-enabled\": false"
 }
 
-# create_warehouse NAME KEY_PREFIX EXTRA_PROFILE_FIELDS
+# create_warehouse NAME KEY_PREFIX ENDPOINT EXTRA_PROFILE_FIELDS
 create_warehouse() {
     curl -sS --fail-with-body -X POST "$LAKEKEEPER_URI/management/v1/warehouse" \
         -H "Content-Type: application/json" \
@@ -115,11 +131,10 @@ create_warehouse() {
     "type": "s3",
     "bucket": "$LAKEKEEPER_BUCKET",
     "key-prefix": "$2",
-    "endpoint": "$AWS_S3_ENDPOINT",
+    "endpoint": "$3",
     "region": "$AWS_REGION",
     "path-style-access": true,
-    "flavor": "s3-compat",
-    "sts-enabled": false$3
+    "flavor": "s3-compat"$4
   },
   "storage-credential": {
     "type": "s3",

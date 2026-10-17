@@ -17,10 +17,8 @@ Every test runs against both of the stack's warehouses:
            `table.io` is FsspecFileIO; opteryx-iceberg must read manifests
            through OpteryxFileIO regardless (IcebergMetastore.load_dataset).
 
-The stack only exists where it was started, so the module SKIPS when
-LAKEKEEPER_URI is unset (a dev machine without Docker). The CI job that starts
-it sets LAKEKEEPER_REQUIRED=1, which turns that skip into a failure: CI must
-never pass this file by skipping it.
+Skips without the stack, fails without it under LAKEKEEPER_REQUIRED - see
+tests/_lakekeeper.py.
 
 Tables are written by plain pyiceberg RestCatalog, independently of
 opteryx-iceberg, into a namespace unique to the run, so the module can be
@@ -34,18 +32,15 @@ import uuid
 
 import pyarrow as pa
 import pytest
+from _lakekeeper import WAREHOUSES
+from _lakekeeper import require_stack
+from _lakekeeper import rest_properties
+from _lakekeeper import rows
+from _lakekeeper import scalar
+from _lakekeeper import writable
+from _lakekeeper import writer as make_writer
 
-if not os.environ.get("LAKEKEEPER_URI"):
-    if os.environ.get("LAKEKEEPER_REQUIRED"):
-        raise RuntimeError(
-            "LAKEKEEPER_REQUIRED is set but LAKEKEEPER_URI is not - load scripts/lakekeeper.env."
-        )
-    pytest.skip(
-        "no Lakekeeper stack (LAKEKEEPER_URI unset) - see scripts/lakekeeper.sh",
-        allow_module_level=True,
-    )
-
-from pyiceberg.catalog import load_catalog
+require_stack()
 
 import opteryx
 from opteryx.connectors import register_workspace
@@ -55,12 +50,6 @@ from opteryx_iceberg import IcebergMetastore
 from opteryx_iceberg import fileio
 
 NAMESPACE = f"ci_{uuid.uuid4().hex[:12]}"
-
-# workspace prefix -> the env var naming its Lakekeeper warehouse
-WAREHOUSES = {
-    "lakekeeper": "LAKEKEEPER_WAREHOUSE",
-    "lakekeeper_default": "LAKEKEEPER_DEFAULT_WAREHOUSE",
-}
 
 ROWS_V1 = pa.table(
     {
@@ -80,28 +69,6 @@ V1_COUNT = 3
 TOTAL = 7
 
 
-def _rest_properties(workspace):
-    return {
-        "uri": f"{os.environ['LAKEKEEPER_URI']}/catalog",
-        "warehouse": os.environ[WAREHOUSES[workspace]],
-    }
-
-
-def rows(session, sql):
-    tables = [m.to_arrow() for m in session.execute_to_morsels(sql) if m.num_rows]
-    if not tables:
-        return []
-    combined = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
-    return combined.to_pylist()
-
-
-def scalar(session, sql):
-    result = rows(session, sql)
-    assert len(result) == 1
-    (value,) = result[0].values()
-    return value
-
-
 @pytest.fixture(scope="module", params=sorted(WAREHOUSES))
 def fixture(request):
     """A two-commit table written through Lakekeeper, read as a workspace.
@@ -110,24 +77,12 @@ def fixture(request):
     SHOW SNAPSHOTS' newest-first order a real assertion.
     """
     workspace = request.param
-    # The writer is pyiceberg's own FileIO - whatever the warehouse serves
-    # (pyarrow for `plain`, fsspec + Lakekeeper's signer for `default`) - with
-    # the key given explicitly. The reader is opteryx-core's S3 client,
-    # configured from the process environment with the same static key.
-    writer = load_catalog(
-        f"{workspace}_writer",
-        type="rest",
-        **_rest_properties(workspace),
-        **{
-            "s3.endpoint": os.environ["AWS_S3_ENDPOINT"],
-            "s3.access-key-id": os.environ["AWS_ACCESS_KEY_ID"],
-            "s3.secret-access-key": os.environ["AWS_SECRET_ACCESS_KEY"],
-            "s3.region": os.environ["AWS_REGION"],
-            "s3.path-style-access": "true",
-        },
-    )
+    writer = make_writer(workspace)
     writer.create_namespace(NAMESPACE)
-    table = writer.create_table(f"{NAMESPACE}.t", schema=ROWS_V1.schema)
+    # `served` is the table as Lakekeeper serves it (what opteryx-iceberg reads
+    # against); `table` writes its files with the static key (see writable).
+    served = writer.create_table(f"{NAMESPACE}.t", schema=ROWS_V1.schema)
+    table = writable(served)
     table.append(ROWS_V1)
     time.sleep(1.2)
     table.append(ROWS_V2)
@@ -138,13 +93,14 @@ def fixture(request):
         OpteryxConnector,
         catalog=IcebergMetastore,
         catalog_type="rest",
-        **_rest_properties(workspace),
+        **rest_properties(workspace),
     )
     yield {
         "workspace": workspace,
         "name": f"{workspace}.{NAMESPACE}.t",
         "session": opteryx.session(user="tests"),
         "table": table,
+        "served": served,
         "first": snapshots[0],
         "last": snapshots[-1],
     }
@@ -161,11 +117,11 @@ class TestWhatLakekeeperServes:
         a different S3 endpoint from opteryx-core's. These reads pass only
         because the two agree - this proves the endpoint is actually served
         (so the check runs), rather than absent (so it is skipped)."""
-        served = fixture["table"].io.properties["s3.endpoint"].rstrip("/")
+        served = fixture["served"].io.properties["s3.endpoint"].rstrip("/")
         assert served == os.environ["AWS_S3_ENDPOINT"].rstrip("/")
 
     def test_the_served_py_io_impl(self, fixture):
-        served = fixture["table"].io.properties.get("py-io-impl")
+        served = fixture["served"].io.properties.get("py-io-impl")
         if fixture["workspace"] == "lakekeeper_default":
             assert served == "pyiceberg.io.fsspec.FsspecFileIO"
         else:
@@ -192,7 +148,7 @@ class TestMetadataIsReadThroughOpteryxCore:
         monkeypatch.setattr(fileio._ObjectReader, "read", spy)
         workspace = fixture["workspace"]
         dataset = IcebergMetastore(
-            workspace, catalog_type="rest", **_rest_properties(workspace)
+            workspace, catalog_type="rest", **rest_properties(workspace)
         ).load_dataset(f"{NAMESPACE}.t")
 
         assert dataset.manifest_bytes() is not None

@@ -124,16 +124,23 @@ Tests run against pyiceberg's own local `SqlCatalog` (SQLite metadata + local-di
 
 ### Lakekeeper (REST catalog over S3, in CI)
 
-`tests/test_lakekeeper_rest.py` reads through a real Iceberg REST catalog — [Lakekeeper](https://docs.lakekeeper.io), backed by Postgres and Silo (S3) — started by `scripts/lakekeeper.sh`. CI runs it as the `lakekeeper` job; locally it needs Docker and skips without the stack:
+Four modules read through a real Iceberg REST catalog — [Lakekeeper](https://docs.lakekeeper.io), backed by Postgres and Silo (S3) — started by `scripts/lakekeeper.sh`:
+
+- `tests/test_lakekeeper_rest.py`: a basic two-commit table — rows, filters, `information_schema`, time travel, `SHOW SNAPSHOTS` — and that manifests are read through opteryx-core.
+- `tests/test_lakekeeper_queries.py`: a query battery. opteryx-core's planets, satellites, missions, TPC-H sf0.01, TPC-DS sf0.01 and `clickbench_tiny` data is loaded into Lakekeeper. Handwritten queries plus core's 22 TPC-H, 99 TPC-DS and 43 ClickBench queries must each give the same outcome as the same query over the original parquet on local disk: the same rows, or the same error. `OPTERYX_CORE_ROOT` names the opteryx-core checkout the data and SQL come from.
+- `tests/test_lakekeeper_surface.py`: table shapes and metadata — a partitioned table (identity and day transforms), schema evolution, a copy-on-write delete, a tag, `TIMESTAMP AS OF`, several namespaces, the refusals for a missing table and a nested column, and that data files take the native parquet scan.
+- `tests/test_lakekeeper_refusals.py`: the identity check against a catalog that trips it — a warehouse serving a different S3 endpoint string, and one vending STS credentials. Both reads must be refused with the cause named.
+
+CI runs all four as the `lakekeeper` job, and opteryx-core's regression suite runs them against its own build. Locally they need Docker and skip without the stack:
 
 ```bash
 set -a; source scripts/lakekeeper.env; set +a
 scripts/lakekeeper.sh up
-python -m pytest tests/test_lakekeeper_rest.py -v
+OPTERYX_CORE_ROOT=../opteryx-core python -m pytest tests/test_lakekeeper_*.py -v
 scripts/lakekeeper.sh down
 ```
 
-Every test runs against two warehouses, both with STS off: one with remote signing off (Lakekeeper serves only the S3 endpoint) and one on Lakekeeper's default (remote signing on, which also serves `py-io-impl: FsspecFileIO`). Writing to the default warehouse needs `s3fs`, which the `test` extra includes. See the script header for why the stack runs on the host network.
+The read tests run against two warehouses: one with STS and remote signing off (Lakekeeper serves only the S3 endpoint) and one on Lakekeeper's default (remote signing on, which also serves `py-io-impl: FsspecFileIO`). The other two warehouses exist for the refusal tests. Test tables' files are always written with pyiceberg's `PyArrowFileIO` and the stack's static key; commits still go through Lakekeeper. Writing through what the default warehouse serves (`FsspecFileIO` behind the remote signer) was intermittently refused by S3. Partitioned writes need `pyiceberg-core`, which the `test` extra includes. See the script header for why the stack runs on the host network.
 
 ### Real REST-catalog interop check
 

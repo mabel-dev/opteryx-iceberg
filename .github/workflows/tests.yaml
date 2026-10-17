@@ -45,14 +45,33 @@ jobs:
   # Tier 1 reads through a real Iceberg REST catalog over S3 - the wire path
   # the SqlCatalog tests above never cross. scripts/lakekeeper.sh starts the
   # stack (host network; see its header for why) and is the same script used
-  # locally. LAKEKEEPER_REQUIRED makes tests/test_lakekeeper_rest.py fail
-  # rather than skip if the stack's environment is missing.
+  # locally. LAKEKEEPER_REQUIRED makes the tests/test_lakekeeper_*.py modules
+  # fail rather than skip if the stack's environment is missing.
+  # tests/test_lakekeeper_queries.py's data and SQL (TPC-H, TPC-DS, ClickBench) are opteryx-core's
+  # own (one home, there): only those paths of core main are checked out. The
+  # engine itself is the PyPI opteryx-core `deps` installs.
   lakekeeper:
     name: lakekeeper REST catalog
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: checkout opteryx-core test data
+      uses: actions/checkout@v4
+      with:
+        repository: mabel-dev/opteryx-core
+        path: opteryx-core
+        sparse-checkout: |
+          testdata/planets
+          testdata/satellites
+          testdata/missions
+          testdata/tpch_001
+          testdata/tpcds_001
+          testdata/clickbench_tiny
+          tests/performance/tpch/opteryx/queries
+          tests/performance/tpcds/opteryx/queries
+          tests/performance/clickbench/opteryx
 
     - uses: actions/setup-python@v5
       with:
@@ -68,12 +87,13 @@ jobs:
       run: |
         cat scripts/lakekeeper.env >> "$GITHUB_ENV"
         echo "LAKEKEEPER_REQUIRED=1" >> "$GITHUB_ENV"
+        echo "OPTERYX_CORE_ROOT=$GITHUB_WORKSPACE/opteryx-core" >> "$GITHUB_ENV"
 
     - name: start Lakekeeper
       run: scripts/lakekeeper.sh up
 
     - name: test
-      run: python -m pytest tests/test_lakekeeper_rest.py -v --durations=10
+      run: python -m pytest tests/test_lakekeeper_*.py -v --durations=10
 
     - name: stack logs
       if: failure()

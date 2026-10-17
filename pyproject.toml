@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.18"
+version = "0.1.19"
 description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -34,7 +34,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=8",
-    "pyiceberg[sql-sqlite,s3fs]==0.12.0rc1",
+    "pyiceberg[sql-sqlite,pyiceberg-core]==0.12.0rc1",
     "pyarrow",
 ]
 
