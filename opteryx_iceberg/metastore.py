@@ -30,6 +30,7 @@ from pyiceberg.table.refs import SnapshotRefType
 from opteryx_iceberg.dataset import IcebergDataset
 from opteryx_iceberg.fileio import PY_IO_IMPL
 from opteryx_iceberg.fileio import IcebergFileIO
+from opteryx_iceberg.fileio import OpteryxFileIO
 
 
 class IcebergMetastore(Metastore):
@@ -88,18 +89,33 @@ class IcebergMetastore(Metastore):
                     'nested form instead, e.g. auth={"type": "google", "google": '
                     '{"scopes": ["https://www.googleapis.com/auth/cloud-platform"]}}.'
                 )
-        self.workspace = workspace
         # Iceberg metadata files (manifest lists, manifests, metadata.json) are
-        # read through opteryx-core's storage clients - one GET each, no HEAD,
-        # warm connections - rather than pyiceberg's default PyArrowFileIO; see
-        # opteryx_iceberg.fileio. A `py-io-impl` given in `properties` is the
-        # caller's explicit choice and replaces this one.
+        # ALWAYS read through opteryx-core's storage clients - one GET each, no
+        # HEAD, warm connections, and the identity check in
+        # opteryx_iceberg.fileio - never through another FileIO. A caller's
+        # `py-io-impl` would be overridden for every manifest read (see
+        # load_dataset), so it is refused rather than silently ignored.
+        if "py-io-impl" in properties:
+            raise ValueError(
+                "opteryx-iceberg reads all Iceberg metadata through OpteryxFileIO; "
+                f"'py-io-impl' is not configurable (got {properties['py-io-impl']!r})."
+            )
+        self.workspace = workspace
         iceberg_properties = {"py-io-impl": PY_IO_IMPL, **properties}
         self._catalog = load_catalog(workspace, type=catalog_type, **iceberg_properties)
         self.io = IcebergFileIO(properties)
 
     def load_dataset(self, identifier: str, load_history: bool = False) -> IcebergDataset:
-        return IcebergDataset(identifier, self._load_table(identifier))
+        table = self._load_table(identifier)
+        # NOT `table.io`. pyiceberg builds a table's FileIO from the catalog's
+        # properties overlaid with what the catalog SERVES for that table (a
+        # REST load-table `config`, storage credentials), and a served
+        # `py-io-impl` wins - Lakekeeper's default warehouse serves
+        # `pyiceberg.io.fsspec.FsspecFileIO`, which would replace OpteryxFileIO
+        # and take manifest reads off opteryx-core. The merged properties are
+        # still the right ones to check identity against, so they are kept and
+        # only the implementation is fixed.
+        return IcebergDataset(identifier, table, OpteryxFileIO(table.io.properties))
 
     def load_view(self, identifier: str):
         # No Iceberg view-spec support in Tier 1. Callers (e.g.

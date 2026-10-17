@@ -211,9 +211,12 @@ class IcebergDataset(Dataset):
     # `Dataset.bounds_are_ordinal` for what mis-declaring this does.
     bounds_are_ordinal = True
 
-    def __init__(self, identifier: str, table):
+    def __init__(self, identifier: str, table, io):
+        """`io` is the FileIO manifests are read through - always an
+        OpteryxFileIO, never `table.io` (see IcebergMetastore.load_dataset)."""
         self.identifier = identifier
         self._table = table
+        self._io = io
 
     @property
     def metadata(self) -> Any:
@@ -346,7 +349,7 @@ class IcebergDataset(Dataset):
             if column_type is not None:
                 ordinal_types[field.field_id] = column_type.physical
 
-        for data_file in plan_data_files(self._table.io, snapshot, self.identifier, ordinal_types):
+        for data_file in plan_data_files(self._io, snapshot, self.identifier, ordinal_types):
             yield {
                 "file_path": _reader_path(data_file.file_path),
                 "file_format": "parquet",

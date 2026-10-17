@@ -67,3 +67,10 @@ def test_retired_flat_auth_kwargs_raise():
         IcebergMetastore(workspace="x", auth_type="google")
     with pytest.raises(ValueError, match="google_auth_scopes.*retired"):
         IcebergMetastore(workspace="x", google_auth_scopes=("s",))
+
+
+def test_a_callers_py_io_impl_is_refused():
+    """Manifests are always read through OpteryxFileIO (see load_dataset), so
+    a caller's `py-io-impl` could only be silently ignored - it is refused."""
+    with pytest.raises(ValueError, match="py-io-impl.*not configurable"):
+        IcebergMetastore(workspace="x", **{"py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"})

@@ -41,3 +41,40 @@ jobs:
 
     - name: test
       run: python -m pytest tests/ -v --durations=10
+
+  # Tier 1 reads through a real Iceberg REST catalog over S3 - the wire path
+  # the SqlCatalog tests above never cross. scripts/lakekeeper.sh starts the
+  # stack (host network; see its header for why) and is the same script used
+  # locally. LAKEKEEPER_REQUIRED makes tests/test_lakekeeper_rest.py fail
+  # rather than skip if the stack's environment is missing.
+  lakekeeper:
+    name: lakekeeper REST catalog
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+        cache: pip
+
+    - name: deps
+      run: |
+        python -m pip install -U pip
+        python -m pip install -e ".[test]"
+
+    - name: load stack environment
+      run: |
+        cat scripts/lakekeeper.env >> "$GITHUB_ENV"
+        echo "LAKEKEEPER_REQUIRED=1" >> "$GITHUB_ENV"
+
+    - name: start Lakekeeper
+      run: scripts/lakekeeper.sh up
+
+    - name: test
+      run: python -m pytest tests/test_lakekeeper_rest.py -v --durations=10
+
+    - name: stack logs
+      if: failure()
+      run: scripts/lakekeeper.sh logs

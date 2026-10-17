@@ -6,7 +6,7 @@ This is Tier 1 of Opteryx's Iceberg support: **reads only**. Writing real Iceber
 
 Kept as its own package - not merged into `opteryx-catalog` or `opteryx-core` - because it depends on `pyiceberg`, which pulls in `pydantic`. Both of those repos are deliberately free of that dependency chain; Iceberg support is optional, the same way `opteryx-access` is.
 
-Iceberg metadata files (manifest lists, manifests, `metadata.json`) are read through opteryx-core's own storage clients (`opteryx_iceberg.fileio.OpteryxFileIO`, installed as the catalog's `py-io-impl`), not pyiceberg's `PyArrowFileIO`: one GET per file with no preceding HEAD, over the engine's warm connections, and no `pyarrow` at runtime. Credentials and the S3 endpoint therefore come from opteryx-core's configuration; a catalog whose properties name a different S3 endpoint or access key, or vend a GCS token, is refused rather than silently read under another identity.
+Iceberg metadata files (manifest lists, manifests, `metadata.json`) are read through opteryx-core's own storage clients (`opteryx_iceberg.fileio.OpteryxFileIO`, installed as the catalog's `py-io-impl`), not pyiceberg's `PyArrowFileIO`: one GET per file with no preceding HEAD, over the engine's warm connections, and no `pyarrow` at runtime. Credentials and the S3 endpoint therefore come from opteryx-core's configuration; a catalog whose properties name a different S3 endpoint or access key, or vend a GCS token, is refused rather than silently read under another identity. This holds whatever FileIO the catalog serves: a REST catalog may serve its own `py-io-impl` in a table load (Lakekeeper's default serves `FsspecFileIO`), and pyiceberg lets that replace the catalog's, so manifests are read through an `OpteryxFileIO` built per table rather than through pyiceberg's `table.io`. A `py-io-impl` passed to `IcebergMetastore` is refused for the same reason.
 
 Manifest lists and manifests are decoded by rugo's native Avro reader (bundled in opteryx-core), not pyiceberg: `opteryx_iceberg.manifests` replaces `table.scan().plan_files()`, making the same decisions pyiceberg's local planner makes with no row filter (live entries, sequence-number inheritance, delete-file matching), and is tested against it. pyiceberg remains the catalog client - `metadata.json`, snapshots and schemas. Planning is always local: a REST catalog configured for server-side scan planning is not asked for a plan.
 
@@ -121,6 +121,19 @@ python -m pytest tests/ -v
 ```
 
 Tests run against pyiceberg's own local `SqlCatalog` (SQLite metadata + local-disk `FileIO`) — no server, no Docker required.
+
+### Lakekeeper (REST catalog over S3, in CI)
+
+`tests/test_lakekeeper_rest.py` reads through a real Iceberg REST catalog — [Lakekeeper](https://docs.lakekeeper.io), backed by Postgres and Silo (S3) — started by `scripts/lakekeeper.sh`. CI runs it as the `lakekeeper` job; locally it needs Docker and skips without the stack:
+
+```bash
+set -a; source scripts/lakekeeper.env; set +a
+scripts/lakekeeper.sh up
+python -m pytest tests/test_lakekeeper_rest.py -v
+scripts/lakekeeper.sh down
+```
+
+Every test runs against two warehouses, both with STS off: one with remote signing off (Lakekeeper serves only the S3 endpoint) and one on Lakekeeper's default (remote signing on, which also serves `py-io-impl: FsspecFileIO`). Writing to the default warehouse needs `s3fs`, which the `test` extra includes. See the script header for why the stack runs on the host network.
 
 ### Real REST-catalog interop check
 

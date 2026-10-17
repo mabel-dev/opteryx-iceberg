@@ -3,9 +3,11 @@
 Two FileIO surfaces share ONE read path:
 
 - `OpteryxFileIO` is a pyiceberg FileIO. IcebergMetastore installs it as the
-  catalog's `py-io-impl`, so every table pyiceberg loads reads its metadata
-  through it, and `opteryx_iceberg.manifests` fetches the manifest list and
-  manifests through the table's `io` - this one.
+  catalog's `py-io-impl`, so a catalog that reads `metadata.json` itself
+  (SQL/Hive/Glue) reads it through this, and `opteryx_iceberg.manifests`
+  fetches the manifest list and manifests through one built per table from
+  the table's merged properties - never through `table.io`, which a REST
+  catalog can re-point by serving its own `py-io-impl`.
 - `IcebergFileIO` is the opteryx_catalog FileIO surface (`metastore.io`).
 
 Each read is the whole object in ONE GET, via
