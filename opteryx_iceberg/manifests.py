@@ -53,6 +53,7 @@ _CONTENT_DATA = 0
 _CONTENT_POSITION_DELETES = 1
 _CONTENT_EQUALITY_DELETES = 2
 _MANIFEST_CONTENT_DELETES = 1
+_DATA_FILE_FORMATS = ("parquet", "avro", "orc")
 
 _LIST_COLUMNS = [
     "manifest_path",
@@ -73,6 +74,7 @@ _ENTRY_COLUMNS = [
     "sequence_number",
     "data_file.content",
     "data_file.file_path",
+    "data_file.file_format",
     "data_file.record_count",
     "data_file.file_size_in_bytes",
 ]
@@ -97,6 +99,7 @@ class ManifestDataFile:
 
     __slots__ = (
         "field_ids",
+        "file_format",
         "file_path",
         "file_size_in_bytes",
         "max_values",
@@ -105,8 +108,9 @@ class ManifestDataFile:
         "record_count",
     )
 
-    def __init__(self, file_path, record_count, file_size_in_bytes, bounds):
+    def __init__(self, file_path, file_format, record_count, file_size_in_bytes, bounds):
         self.file_path = file_path
+        self.file_format = file_format
         self.record_count = record_count
         self.file_size_in_bytes = file_size_in_bytes
         self.field_ids, self.min_values, self.max_values, self.null_counts = bounds
@@ -266,6 +270,20 @@ def _refuse_equality_deletes(identifier: str) -> None:
     )
 
 
+def _data_file_format(identifier: str, file_path: str, file_format: str | None) -> str:
+    """The format a data file's manifest entry declares, as the lower-case name the
+    opteryx manifest carries. The Iceberg spec allows exactly these three; an
+    entry that names anything else (or nothing) is a corrupt manifest."""
+    name = (file_format or "").lower()
+    if name not in _DATA_FILE_FORMATS:
+        raise ValueError(
+            f"opteryx-iceberg cannot read {identifier!r}: data file {file_path!r} "
+            f"declares file format {file_format!r}; the Iceberg spec allows "
+            "PARQUET, AVRO and ORC."
+        )
+    return name
+
+
 def plan_data_files(
     io: Any, snapshot: Any, identifier: str, ordinal_types: dict
 ) -> list[ManifestDataFile]:
@@ -321,6 +339,9 @@ def plan_data_files(
             if content == _CONTENT_DATA and not is_delete_manifest:
                 data_file = ManifestDataFile(
                     cols["data_file.file_path"][i],
+                    _data_file_format(
+                        identifier, cols["data_file.file_path"][i], cols["data_file.file_format"][i]
+                    ),
                     record_count,
                     cols["data_file.file_size_in_bytes"][i],
                     cols["bounds"][i],

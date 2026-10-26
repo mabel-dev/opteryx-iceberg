@@ -6,6 +6,7 @@ Read-only (Tier 1). `append` and any other write path raise NotImplementedError.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote
 from urllib.parse import urlparse
@@ -21,10 +22,15 @@ from pyiceberg.types import BooleanType
 from pyiceberg.types import DateType
 from pyiceberg.types import DecimalType
 from pyiceberg.types import DoubleType
+from pyiceberg.types import FixedType
 from pyiceberg.types import FloatType
 from pyiceberg.types import IntegerType
+from pyiceberg.types import ListType
 from pyiceberg.types import LongType
+from pyiceberg.types import MapType
 from pyiceberg.types import StringType
+from pyiceberg.types import StructType
+from pyiceberg.types import TimeType
 from pyiceberg.types import TimestampType
 from pyiceberg.types import TimestamptzType
 from pyiceberg.types import UUIDType
@@ -55,7 +61,10 @@ _PRIMITIVE_TYPES = {
     TimestampType: "TIMESTAMP",
     TimestamptzType: "TIMESTAMP",
     StringType: "VARCHAR",
-    UUIDType: "VARCHAR",
+    # A real type, not text (opteryx-core docs/UUID_TYPE_DESIGN.md): 16 bytes, one meaning in
+    # every format. It was VARCHAR before the type existed, which made a table with a uuid
+    # column unreadable - the Parquet scan refused a fixed_len_byte_array under a varchar plan.
+    UUIDType: "UUID",
     # Unannotated parquet BYTE_ARRAY (e.g. the canonical ClickBench hits.parquet
     # text columns). VARBINARY is what core's parquet reader types the same
     # column as when it reads the file directly, so a query means the same thing
@@ -64,9 +73,118 @@ _PRIMITIVE_TYPES = {
 }
 
 
+# The element types of a list that surfaces as an ARRAY, spelled as opteryx-core's own Parquet reader
+# types the same column (READ_PARQUET binds array<int32> as ARRAY<INT64>, array<float32> as
+# ARRAY<FLOAT64>). Any other list of scalars is refused rather than guessed at.
+_ARRAY_ELEMENTS = {
+    BooleanType: "BOOLEAN",
+    IntegerType: "INT64",
+    LongType: "INT64",
+    FloatType: "FLOAT64",
+    DoubleType: "FLOAT64",
+    StringType: "VARCHAR",
+}
+
+
+def _list_bottom(field_type: Any) -> tuple[Any, int]:
+    """The element type at the bottom of a list nest, and how many lists deep it is."""
+    depth = 0
+    while isinstance(field_type, ListType):
+        field_type = field_type.element_type
+        depth += 1
+    return field_type, depth
+
+
+def _nested_display_type(field_type: Any) -> str:
+    """The type a STRUCT / MAP / LIST column binds to (docs/UUID_AND_NESTED_COLUMNS_DESIGN.md §3.1): JSON
+    text (NVARCHAR) for a struct, a map with string keys, and a list with a struct or map at the bottom;
+    an ARRAY for a list of a plain scalar. Anything else is refused, naming it."""
+    if isinstance(field_type, StructType):
+        _check_nested(field_type)
+        return "NVARCHAR"
+    if isinstance(field_type, MapType):
+        _check_nested(field_type)
+        return "NVARCHAR"
+    bottom, depth = _list_bottom(field_type)
+    if isinstance(bottom, (StructType, MapType)):
+        _check_nested(bottom)
+        return "NVARCHAR"
+    for scalar, display in _ARRAY_ELEMENTS.items():
+        if isinstance(bottom, scalar):
+            if depth == 1:
+                return f"ARRAY<{display}>"
+            raise NotImplementedError(
+                f"opteryx-iceberg does not support a list of lists of {bottom!r} yet: the engine's own "
+                "Parquet reader declares a nested ARRAY one level short"
+            )
+    raise NotImplementedError(f"opteryx-iceberg does not support a list of {bottom!r} yet")
+
+
+def _check_nested(field_type: Any) -> None:
+    """Refuse, naming it, a nested type the JSON rendering cannot hold: a map whose keys are not strings
+    (a JSON object's keys are strings)."""
+    if isinstance(field_type, MapType):
+        if not isinstance(field_type.key_type, StringType):
+            raise NotImplementedError(
+                f"opteryx-iceberg does not support a map with {field_type.key_type!r} keys: a JSON "
+                "object's keys are strings"
+            )
+        _check_nested(field_type.value_type)
+    elif isinstance(field_type, StructType):
+        for field in field_type.fields:
+            _check_nested(field.field_type)
+    elif isinstance(field_type, ListType):
+        _check_nested(field_type.element_type)
+
+
+def _nested_tree(field_id: int, name: str, field_type: Any) -> tuple:
+    """The declared shape of a nested column as plain tuples (kind, field id, name, children):
+    opteryx-core's NestedField, spelled without importing it. A list's element and a map's key / value
+    are named "element" / "key" / "value"; their names are never compared."""
+    if isinstance(field_type, StructType):
+        return ("struct", field_id, name, tuple(_nested_tree(f.field_id, f.name, f.field_type) for f in field_type.fields))
+    if isinstance(field_type, ListType):
+        return ("list", field_id, name, (_nested_tree(field_type.element_id, "element", field_type.element_type),))
+    if isinstance(field_type, MapType):
+        return (
+            "map",
+            field_id,
+            name,
+            (
+                _nested_tree(field_type.key_id, "key", field_type.key_type),
+                _nested_tree(field_type.value_id, "value", field_type.value_type),
+            ),
+        )
+    return ("scalar", field_id, name, ())
+
+
+@dataclass
+class IcebergSchemaColumn(SchemaColumn):
+    """A catalog SchemaColumn that also carries the column's declared nested shape (see `_nested_tree`),
+    which opteryx-core verifies each data file against."""
+
+    nested: tuple | None = None
+
+
 def _display_type(field_type: Any) -> str:
+    if isinstance(field_type, (StructType, MapType, ListType)):
+        return _nested_display_type(field_type)
     if isinstance(field_type, DecimalType):
         return f"DECIMAL({field_type.precision}, {field_type.scale})"
+    if isinstance(field_type, FixedType):
+        # fixed(L): bytes whose length is L. Avro and ORC data files carry the length and the
+        # reader checks every value against it; a Parquet fixed_len_byte_array that is neither a
+        # decimal nor a uuid is still refused by core's Parquet reader (loudly).
+        return "VARBINARY"
+    if isinstance(field_type, TimeType):
+        # Held, not unsupported by design (opteryx-core docs/UUID_AND_NESTED_COLUMNS_DESIGN.md UD6
+        # required a Parquet check first, and it failed): the engine reads a Parquet TIME column -
+        # and CAST(... AS TIME) - as INT64 microseconds, while the Avro and ORC readers produce
+        # TIME64 (datetime.time). One Iceberg type must not mean two things by file format.
+        raise NotImplementedError(
+            "opteryx-iceberg does not support Iceberg type 'time' yet: the engine does not "
+            "represent TIME the same way in Parquet and in Avro/ORC data files"
+        )
     for iceberg_type, display in _PRIMITIVE_TYPES.items():
         if isinstance(field_type, iceberg_type):
             return display
@@ -299,11 +417,14 @@ class IcebergDataset(Dataset):
         if iceberg_schema is None:
             iceberg_schema = self._table.schema()
         columns = [
-            SchemaColumn(
+            IcebergSchemaColumn(
                 name=field.name,
                 type=_display_type(field.field_type),
                 nullable=not field.required,
                 id=field.field_id,
+                nested=_nested_tree(field.field_id, field.name, field.field_type)
+                if isinstance(field.field_type, (StructType, ListType, MapType))
+                else None,
             )
             for field in iceberg_schema.fields
         ]
@@ -352,7 +473,7 @@ class IcebergDataset(Dataset):
         for data_file in plan_data_files(self._io, snapshot, self.identifier, ordinal_types):
             yield {
                 "file_path": _reader_path(data_file.file_path),
-                "file_format": "parquet",
+                "file_format": data_file.file_format,
                 "record_count": data_file.record_count,
                 "file_size_in_bytes": data_file.file_size_in_bytes,
                 "field_ids": data_file.field_ids,
@@ -403,10 +524,10 @@ def _column_type(field_type: Any) -> Any:
     (opteryx-core src/cpp/planner/iceberg_bounds.hpp)."""
     from opteryx.types.logical_type import try_parse_column_type
 
-    if isinstance(field_type, UUIDType):
-        # pyiceberg decodes a UUID bound to a `uuid.UUID`, which has no ordinal
-        # in the VARCHAR space the column is bound to: no bound (no statistics
-        # is slower, never wrong).
+    if isinstance(field_type, (UUIDType, TimeType, FixedType)):
+        # No ordinal key for these (UUID: opteryx-core UUID design U14 - no min/max pruning yet;
+        # time and fixed: not mapped to an ordinal here): no bound. No statistics is slower,
+        # never wrong.
         return None
     for iceberg_type in (*_PRIMITIVE_TYPES, DecimalType):
         if isinstance(field_type, iceberg_type):

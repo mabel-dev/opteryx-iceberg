@@ -386,3 +386,25 @@ def test_a_decimal128_column_has_no_bounds_and_the_others_keep_theirs(tmp_path):
     # Iceberg recorded a bound for `w`; it is left out, not refused.
     assert bounds[by_name["w"]] == (None, None)
     assert bounds[by_name["n"]] == (3, 4)
+
+
+def test_a_data_file_carries_the_format_its_manifest_entry_declares(tmp_path):
+    table = _catalog(tmp_path).create_table("n.t", schema=SCHEMA)
+    table.append(_batch(0))
+    got = _plan(table, table.current_snapshot())
+    assert [d.file_format for d in got] == ["parquet"]
+
+
+@pytest.mark.parametrize("declared", ["PARQUET", "parquet", "AVRO", "Avro", "ORC", "orc"])
+def test_a_spec_format_is_stamped_lower_case(declared):
+    from opteryx_iceberg.manifests import _data_file_format
+
+    assert _data_file_format("n.t", "f", declared) == declared.lower()
+
+
+@pytest.mark.parametrize("declared", ["PUFFIN", "csv", "", None])
+def test_a_format_the_spec_does_not_allow_is_refused_by_name(declared):
+    from opteryx_iceberg.manifests import _data_file_format
+
+    with pytest.raises(ValueError, match="PARQUET, AVRO and ORC"):
+        _data_file_format("n.t", "f", declared)
