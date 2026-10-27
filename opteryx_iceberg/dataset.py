@@ -65,6 +65,9 @@ _PRIMITIVE_TYPES = {
     # every format. It was VARCHAR before the type existed, which made a table with a uuid
     # column unreadable - the Parquet scan refused a fixed_len_byte_array under a varchar plan.
     UUIDType: "UUID",
+    # Microseconds since midnight. Parquet is canon: the engine reads a TIME column, and every other
+    # format's, as INT64 microseconds, so `time` surfaces as that integer in Parquet, Avro and ORC alike.
+    TimeType: "TIME",
     # Unannotated parquet BYTE_ARRAY (e.g. the canonical ClickBench hits.parquet
     # text columns). VARBINARY is what core's parquet reader types the same
     # column as when it reads the file directly, so a query means the same thing
@@ -176,15 +179,6 @@ def _display_type(field_type: Any) -> str:
         # reader checks every value against it; a Parquet fixed_len_byte_array that is neither a
         # decimal nor a uuid is still refused by core's Parquet reader (loudly).
         return "VARBINARY"
-    if isinstance(field_type, TimeType):
-        # Held, not unsupported by design (opteryx-core docs/UUID_AND_NESTED_COLUMNS_DESIGN.md UD6
-        # required a Parquet check first, and it failed): the engine reads a Parquet TIME column -
-        # and CAST(... AS TIME) - as INT64 microseconds, while the Avro and ORC readers produce
-        # TIME64 (datetime.time). One Iceberg type must not mean two things by file format.
-        raise NotImplementedError(
-            "opteryx-iceberg does not support Iceberg type 'time' yet: the engine does not "
-            "represent TIME the same way in Parquet and in Avro/ORC data files"
-        )
     for iceberg_type, display in _PRIMITIVE_TYPES.items():
         if isinstance(field_type, iceberg_type):
             return display

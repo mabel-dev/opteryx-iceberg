@@ -1,11 +1,11 @@
 """Iceberg STRUCT / MAP / LIST columns, read through SQL
-(opteryx-core docs/UUID_AND_NESTED_COLUMNS_DESIGN.md §3.1 and §3.3, option (b)).
+(opteryx-core docs/UUID_AND_NESTED_COLUMNS_DESIGN.md §3.1 and §3.3, options (b) and (c)).
 
 A struct, a map with string keys, and a list with a struct or map at the bottom are one JSON value per
 row; a list of a plain scalar is an ARRAY. A JSON object is made of NAMES and Iceberg identifies a
-nested field by ID, so each data file is verified against the table's declared nested shape: a file
-whose field ids or struct member names disagree (the table was evolved after the file was written) fails
-the query naming the field. It is never rendered with names that may have drifted.
+nested field by ID, so each data file's nested fields are MATCHED BY ID to the table's declared nested shape and rendered with
+the table's names (option (c)): a file written before a rename, an add or a drop reads as the table says -
+a renamed member under its new name, an added member as null, a dropped member not at all.
 
 pyiceberg writes the tables and data (Parquet); every expected value is the value the test wrote.
 """
@@ -111,30 +111,68 @@ def _append_after_evolution(env, struct_fields):
     env.catalog.load_table("ns.t").append(pa.table(values, schema=schema))
 
 
-def test_a_renamed_nested_field_fails_naming_it(env):
+def test_a_renamed_nested_field_reads_under_the_new_name(env):
     with env.catalog.load_table("ns.t").update_schema() as update:
         update.rename_column("s.a", "aa")
     _append_after_evolution(env, [pa.field("aa", pa.int64()), pa.field("b", pa.string())])
-    with pytest.raises(Exception, match=r"column 's\.a': the table declares this field as 'aa'.*calls it 'a'"):
-        env.rows(f"SELECT id, s FROM {env.name}")
-    # a query that does not touch the evolved column is unaffected
+    # The file written before the rename says "a"; the table says "aa" - same field id, so the old
+    # rows render under the table's name and the new row alongside them.
+    got = _json_rows(env, "s")
+    assert got == {1: {"aa": 1, "b": "x"}, 2: None, 3: {"aa": None, "b": 'q"t'}, 9: {"aa": None, "b": None}}
     assert env.rows(f"SELECT COUNT(*) FROM {env.name}") == [(4,)]
-    assert _json_rows(env, "ls") == {1: [1, 2], 2: None, 3: [], 9: None}
 
 
-def test_a_nested_field_added_after_a_file_was_written_fails_naming_the_column(env):
+def test_a_nested_field_added_after_a_file_was_written_is_null_in_the_old_file(env):
     with env.catalog.load_table("ns.t").update_schema() as update:
         update.add_column(("s", "c"), LongType())
     _append_after_evolution(
         env, [pa.field("a", pa.int64()), pa.field("b", pa.string()), pa.field("c", pa.int64())]
     )
-    with pytest.raises(Exception, match=r"column 's': the table declares 3 members but the file has 2"):
-        env.rows(f"SELECT id, s FROM {env.name}")
+    got = _json_rows(env, "s")
+    assert got[1] == {"a": 1, "b": "x", "c": None}          # the old file has no "c"
+    assert got[2] is None
+    assert got[9] == {"a": None, "b": None, "c": None}      # the new file has it
+
+
+def test_a_nested_field_dropped_after_a_file_was_written_is_not_rendered(env):
+    with env.catalog.load_table("ns.t").update_schema() as update:
+        update.delete_column(("s", "b"))
+    _append_after_evolution(env, [pa.field("a", pa.int64())])
+    got = _json_rows(env, "s")
+    assert got[1] == {"a": 1}                               # the old file still holds "b"; the table dropped it
+    assert got[3] == {"a": None}
+
+
+def test_a_reordered_struct_renders_in_the_tables_order(env):
+    with env.catalog.load_table("ns.t").update_schema() as update:
+        update.move_first("s.b")
+    _append_after_evolution(env, [pa.field("b", pa.string()), pa.field("a", pa.int64())])
+    text = dict(env.rows(f"SELECT id, s FROM {env.name}"))
+    assert text[1] == '{"b":"x","a":1}'
+
+
+def test_a_list_of_structs_follows_a_renamed_member(env):
+    with env.catalog.load_table("ns.t").update_schema() as update:
+        update.rename_column("lst.element.k", "kk")
+    schema = pa.schema(
+        [
+            ARROW.field("id"),
+            ARROW.field("s"),
+            ARROW.field("m"),
+            ARROW.field("ls"),
+            pa.field("lst", pa.list_(pa.field("element", pa.struct([pa.field("kk", pa.int64())])))),
+        ]
+    )
+    env.catalog.load_table("ns.t").append(
+        pa.table({"id": [9], "s": [None], "m": [None], "ls": [None], "lst": [[{"kk": 7}]]}, schema=schema)
+    )
+    got = _json_rows(env, "lst")
+    assert got[1] == [{"kk": 1}, {"kk": 2}]
+    assert got[9] == [{"kk": 7}]
 
 
 def test_reading_the_old_snapshot_after_the_change_still_works(env):
-    # The snapshot written before the rename is read through the schema it was written under, so the
-    # file and the declaration agree there.
+    # The snapshot written before the rename is read through the schema it was written under.
     old = env.catalog.load_table("ns.t").current_snapshot().snapshot_id
     with env.catalog.load_table("ns.t").update_schema() as update:
         update.rename_column("s.a", "aa")

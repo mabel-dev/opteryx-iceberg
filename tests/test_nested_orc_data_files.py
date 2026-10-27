@@ -3,8 +3,8 @@
 
 The same contract as the Parquet tests (tests/test_nested_columns.py): a struct, a string-keyed map and
 a list with a struct at the bottom are one JSON value per row, a list of a plain scalar is an ARRAY, and
-each file's nested field ids and struct member names are verified against the table's declared shape -
-a file that disagrees (the table was evolved after it was written) fails the query naming the field.
+each file's nested fields are matched by `iceberg.id` to the table's declared shape and rendered with the
+table's names (option (c)) - a file written before a rename, an add or a drop reads as the table says.
 
 pyarrow.orc writes the data; tests/_orc_data_files.py gives every nested type Iceberg's `iceberg.id`
 attribute. Every expected value is the value the test wrote.
@@ -129,25 +129,65 @@ def test_an_unevolved_orc_table_reads_every_nested_shape(env):
     assert env.scan_sources == {"NativeOrcScanSource"}
 
 
-def test_a_renamed_nested_field_fails_naming_it(env, caplog):
+def test_a_renamed_nested_field_reads_under_the_new_name(env):
     with env.catalog.load_table("ns.t").update_schema() as update:
         update.rename_column("s.a", "aa")
     env.table = env.catalog.load_table("ns.t")
     env.add(env.orc_file("b.orc", _rows(10, "aa")))     # written after the rename; a.orc was not
+    # a.orc says "a", the table says "aa": the same field id, so the old rows render under the new name.
+    assert _json(env, "s") == {1: {"aa": 1, "b": "x"}, 2: None, 10: {"aa": 10, "b": "x"}, 11: None}
+
+
+def test_a_nested_field_added_after_a_file_was_written_is_null_in_the_old_file(env):
+    with env.catalog.load_table("ns.t").update_schema() as update:
+        update.add_column(("s", "c"), LongType())
+    env.table = env.catalog.load_table("ns.t")
+    wide = pa.schema(
+        [
+            _arrow().field("id"),
+            pa.field("s", pa.struct([pa.field("a", pa.int64()), pa.field("b", pa.string()), pa.field("c", pa.int64())])),
+            _arrow().field("m"),
+            _arrow().field("ls"),
+            _arrow().field("lst"),
+        ]
+    )
+    table = pa.table(
+        {"id": [10], "s": [{"a": 1, "b": "y", "c": 5}], "m": [None], "ls": [None], "lst": [None]}, schema=wide
+    )
+    env.add(env.orc_file("b.orc", table))
+    got = _json(env, "s")
+    assert got[1] == {"a": 1, "b": "x", "c": None}
+    assert got[10] == {"a": 1, "b": "y", "c": 5}
+
+
+def test_a_nested_field_dropped_after_a_file_was_written_is_not_rendered(env):
+    with env.catalog.load_table("ns.t").update_schema() as update:
+        update.delete_column(("s", "b"))
+    env.table = env.catalog.load_table("ns.t")
+    slim = pa.schema(
+        [
+            _arrow().field("id"),
+            pa.field("s", pa.struct([pa.field("a", pa.int64())])),
+            _arrow().field("m"),
+            _arrow().field("ls"),
+            _arrow().field("lst"),
+        ]
+    )
+    table = pa.table({"id": [10], "s": [{"a": 2}], "m": [None], "ls": [None], "lst": [None]}, schema=slim)
+    env.add(env.orc_file("b.orc", table))
+    got = _json(env, "s")
+    assert got[1] == {"a": 1}      # a.orc still holds "b"; the table dropped it
+    assert got[10] == {"a": 2}
+
+
+def test_a_file_without_the_nested_field_ids_cannot_be_matched(env, caplog):
+    path = env.root / "data" / "bare.orc"
+    top_level = {k: v for k, v in env.ids().items() if "." not in k and "[" not in k}
+    path.write_bytes(with_nested_iceberg_ids(orc_bytes(_rows(20)), top_level))     # ids on the columns only
+    env.add(data_file(path, FileFormat.ORC, 2, path.stat().st_size))
     # An ORC file is opened at execution time, where the engine reports a read failure to the caller
     # generically and logs the cause - which names the field and the file.
     with pytest.raises(DatasetReadError):
         env.rows(f"SELECT id, s FROM {env.name}")
-    assert "column 's.a': the table declares this field as 'aa' (id" in caplog.text
-    assert "a.orc" in caplog.text
-    assert _json(env, "ls") == {1: [1, 2], 2: None, 10: [1, 2], 11: None}   # columns not touched are fine
-
-
-def test_a_file_without_the_nested_field_ids_fails_naming_the_column(env, caplog):
-    path = env.root / "data" / "bare.orc"
-    top_level = {k: v for k, v in env.ids().items() if "." not in k and "[" not in k}
-    path.write_bytes(with_nested_iceberg_ids(orc_bytes(_rows(20)), top_level))     # ids on the columns, none on their nested types
-    env.add(data_file(path, FileFormat.ORC, 2, path.stat().st_size))
-    with pytest.raises(DatasetReadError):
-        env.rows(f"SELECT id, s FROM {env.name}")
-    assert "carries no iceberg.id for it" in caplog.text
+    assert "carries no iceberg.id" in caplog.text
+    assert "bare.orc" in caplog.text

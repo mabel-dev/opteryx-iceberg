@@ -3,8 +3,7 @@
 
 uuid binds as the engine's UUID type and fixed(L) as VARBINARY - in Parquet (uuid), Avro (uuid; fixed
 is refused, loudly) and ORC (both, driven by the `iceberg.binary-type` / `iceberg.length`
-attributes). `time` is HELD: the UD6 Parquet check failed (the engine reads a Parquet TIME column as
-INT64 microseconds, Avro/ORC produce TIME64), so an Iceberg `time` column is refused at schema time.
+attributes). `time` follows Parquet, which is canon: INT64 microseconds since midnight in all three formats.
 Every expected value is the value the test wrote."""
 
 import datetime
@@ -77,13 +76,42 @@ def test_parquet_uuid_reads_compares_orders_and_aggregates(parquet_table):
     assert env.rows(f"SELECT u, COUNT(*) FROM {env.name} WHERE u IS NOT NULL GROUP BY u") == _sort([(u, 1) for u in UUIDS])
 
 
-def test_time_is_refused_at_schema_time_until_parquet_and_avro_orc_agree(tmp_path):
-    env = Env(tmp_path, schema=Schema(NestedField(1, "id", LongType(), required=False), NestedField(2, "t", TimeType(), required=False)))
+TIMES = [datetime.time(0, 0, 1), datetime.time(12, 30, 45, 123456), datetime.time(23, 59, 59, 999999)]
+# Parquet is canon: the engine reads a TIME column as INT64 microseconds since midnight, and Avro and ORC
+# fold into that - so the same `time` value is the same integer whatever the data file's format.
+MICROS = [((t.hour * 60 + t.minute) * 60 + t.second) * 1_000_000 + t.microsecond for t in TIMES]
+TIME_SCHEMA = Schema(NestedField(1, "id", LongType(), required=False), NestedField(2, "t", TimeType(), required=False))
+
+
+def _time_expected():
+    return _sort([(i + 1, MICROS[i]) for i in range(3)])
+
+
+def test_parquet_time_is_int64_microseconds(tmp_path):
+    env = Env(tmp_path, schema=TIME_SCHEMA)
     env.catalog.load_table("ns.t").append(
-        pa.table({"id": pa.array([1], pa.int64()), "t": pa.array([datetime.time(0, 0, 1)], pa.time64("us"))})
+        pa.table({"id": pa.array([1, 2, 3], pa.int64()), "t": pa.array(TIMES, pa.time64("us"))})
     )
-    with pytest.raises(Exception, match="'time'"):
-        env.rows(f"SELECT t FROM {env.name}")
+    assert env.rows(f"SELECT id, t FROM {env.name}") == _time_expected()
+    assert env.rows(f"SELECT MAX(t), MIN(t) FROM {env.name}") == [(MICROS[2], MICROS[0])]
+
+
+def test_avro_time_is_the_same_integer(tmp_path):
+    env = Env(tmp_path, schema=TIME_SCHEMA)
+    path = tmp_path / "data" / "a.avro"
+    fields = [avro_field("id", 1, "long"), avro_field("t", 2, {"type": "long", "logicalType": "time-micros"})]
+    size = write_avro_data_file(path, fields, [{"id": i + 1, "t": TIMES[i]} for i in range(3)])
+    env.add(data_file(path, FileFormat.AVRO, 3, size))
+    assert env.rows(f"SELECT id, t FROM {env.name}") == _time_expected()
+
+
+def test_orc_time_is_the_same_integer(tmp_path):
+    env = Env(tmp_path, schema=TIME_SCHEMA)
+    path = tmp_path / "data" / "a.orc"
+    table = pa.table({"id": pa.array([1, 2, 3], pa.int64()), "t": pa.array(MICROS, pa.int64())})
+    path.write_bytes(orc_bytes(table, {"id": 1, "t": 2}, {"t": {"iceberg.long-type": "TIME"}}))
+    env.add(data_file(path, FileFormat.ORC, 3, path.stat().st_size))
+    assert env.rows(f"SELECT id, t FROM {env.name}") == _time_expected()
 
 
 def test_parquet_fixed_is_refused_loudly(tmp_path):
