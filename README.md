@@ -107,7 +107,7 @@ The counter columns come from the snapshot summary, which Iceberg holds as strin
 - Any write path: `CREATE`/`DROP`/`ALTER`/`INSERT`/`rename` all raise `NotImplementedError` — that's Tier 2.
 - Iceberg views (Iceberg's view spec has no equivalent here yet).
 - Opteryx's own sketch-based pruning stats (`min_k_hashes`/histograms) — standard Iceberg manifests don't carry them; queries fall back to standard bounds-based pruning.
-- Nested Iceberg types (struct/map/list) — `IcebergDataset.schema()` raises rather than silently misrepresenting them. Note this makes a table with *any* nested column unreadable, including for a query that touches only its scalar columns.
+- Some nested Iceberg types. A struct, a map with string keys, and a list with a struct or map at the bottom read as JSON text; a list of a plain scalar reads as an ARRAY. A list of lists of a scalar, a map whose keys are not strings, and a list of a scalar with no ARRAY element type are refused by `IcebergDataset.schema()` with the cause named, rather than misrepresented. Note this makes a table with *any* such column unreadable, including for a query that touches only its other columns.
 - Iceberg's own triggers/views listings (`list_views`/`list_triggers` return empty, which is the truthful answer for a Tier 1 reader rather than a stub).
 
 ## Local development
@@ -128,7 +128,7 @@ Four modules read through a real Iceberg REST catalog — [Lakekeeper](https://d
 
 - `tests/test_lakekeeper_rest.py`: a basic two-commit table — rows, filters, `information_schema`, time travel, `SHOW SNAPSHOTS` — and that manifests are read through opteryx-core.
 - `tests/test_lakekeeper_queries.py`: a query battery. opteryx-core's planets, satellites, missions, TPC-H sf0.01, TPC-DS sf0.01 and `clickbench_tiny` data is loaded into Lakekeeper. Handwritten queries plus core's 22 TPC-H, 99 TPC-DS and 43 ClickBench queries must each give the same outcome as the same query over the original parquet on local disk: the same rows, or the same error. `OPTERYX_CORE_ROOT` names the opteryx-core checkout the data and SQL come from.
-- `tests/test_lakekeeper_surface.py`: table shapes and metadata — a partitioned table (identity and day transforms), schema evolution, a copy-on-write delete, a tag, `TIMESTAMP AS OF`, several namespaces, the refusals for a missing table and a nested column, and that data files take the native parquet scan.
+- `tests/test_lakekeeper_surface.py`: table shapes and metadata — a partitioned table (identity and day transforms), schema evolution, a copy-on-write delete, a tag, `TIMESTAMP AS OF`, several namespaces, the refusal for a missing table, a nested (list) column, and that data files take the native parquet scan.
 - `tests/test_lakekeeper_refusals.py`: the identity check against a catalog that trips it — a warehouse serving a different S3 endpoint string, and one vending STS credentials. Both reads must be refused with the cause named.
 
 CI runs all four as the `lakekeeper` job, and opteryx-core's regression suite runs them against its own build. Locally they need Docker and skip without the stack:

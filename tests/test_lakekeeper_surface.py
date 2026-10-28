@@ -33,7 +33,6 @@ require_stack()
 import opteryx
 from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
-from opteryx.exceptions import DatasetMetadataReadError
 from opteryx.exceptions import DatasetNotFoundError
 from pyiceberg.expressions import EqualTo
 from pyiceberg.partitioning import PartitionField
@@ -294,10 +293,12 @@ class TestRefusals:
         with pytest.raises(DatasetNotFoundError):
             rows(surface["session"], f"SELECT * FROM {surface['main']}.no_such_table")
 
-    def test_a_nested_column_refuses_the_table(self, surface):
-        """Refused with the cause named - not read with the column dropped or
-        mis-typed (see the README). The table exists only for this test: while
-        it does, information_schema over the workspace fails too."""
+
+class TestNested:
+    def test_a_nested_column_reads(self, surface):
+        """A list of a plain scalar is an ARRAY (tests/test_nested_columns.py
+        covers every nested shape locally); here it is read through the REST
+        catalog, without the nested column and with it."""
         writer = surface["writer"]
         nested = writable(writer.create_table(
             f"{MAIN}.nested",
@@ -307,9 +308,10 @@ class TestRefusals:
             nested.append(
                 pa.table({"id": pa.array([1], pa.int64()), "tags": pa.array([["p", "q"]])})
             )
-            with pytest.raises(DatasetMetadataReadError) as caught:
-                rows(surface["session"], f"SELECT id FROM {surface['main']}.nested")
-            assert "nested/complex types are out of scope" in str(caught.value)
+            assert rows(surface["session"], f"SELECT id FROM {surface['main']}.nested") == [{"id": 1}]
+            assert rows(surface["session"], f"SELECT id, tags FROM {surface['main']}.nested") == [
+                {"id": 1, "tags": ["p", "q"]}
+            ]
         finally:
             writer.drop_table(f"{MAIN}.nested")
 
