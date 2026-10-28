@@ -36,6 +36,7 @@ test = [
     "pytest>=8",
     "pyiceberg[sql-sqlite,pyiceberg-core]==0.12.0rc1",
     "pyarrow",
+    "fastavro",
 ]
 
 [tool.setuptools.package-dir]
