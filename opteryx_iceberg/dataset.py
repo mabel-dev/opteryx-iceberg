@@ -262,7 +262,6 @@ class IcebergSnapshot:
     """
 
     __slots__ = (
-        "_snapshot",
         "snapshot_id",
         "parent_snapshot_id",
         "sequence_number",
@@ -277,7 +276,6 @@ class IcebergSnapshot:
     )
 
     def __init__(self, snapshot: Any):
-        self._snapshot = snapshot
         self.snapshot_id = snapshot.snapshot_id
         self.parent_snapshot_id = snapshot.parent_snapshot_id
         self.sequence_number = snapshot.sequence_number
@@ -289,10 +287,8 @@ class IcebergSnapshot:
         # `schema_id` is an INT in Iceberg and a VARCHAR column in opteryx's
         # output (opteryx_catalog spells its schema ids as strings), so it is
         # stringified here rather than at the vector builder, which would
-        # reject the int outright. Safe against the other reader of this
-        # attribute: `_resolve_snapshot` passes it to `IcebergDataset.schema`,
-        # which ignores the argument entirely and returns the table's current
-        # schema (Tier 1 has no historical-schema lookup).
+        # reject the int outright. `IcebergDataset.schema`, the other reader of
+        # this attribute, accepts either form.
         self.schema_id = None if snapshot.schema_id is None else str(snapshot.schema_id)
 
         summary = snapshot.summary
@@ -458,8 +454,21 @@ class IcebergDataset(Dataset):
         if snapshot is None:
             return
         iceberg_schema = self._table.schema()
+        # A column widened since (int -> long, float -> double) keeps the narrower
+        # bounds in files written before the change, which the decoder refuses at
+        # the current width - so such a column has no bounds. No pruning on it,
+        # never a failed read.
+        past_types = [
+            {field.field_id: field.field_type for field in schema.fields}
+            for schema in self._table.schemas().values()
+        ]
         ordinal_types = {}
         for field in iceberg_schema.fields:
+            if any(
+                types.get(field.field_id, field.field_type) != field.field_type
+                for types in past_types
+            ):
+                continue
             column_type = _column_type(field.field_type)
             if column_type is not None:
                 ordinal_types[field.field_id] = column_type.physical

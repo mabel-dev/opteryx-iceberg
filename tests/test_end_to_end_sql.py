@@ -255,3 +255,37 @@ class TestPredicatePruning:
         the attribution above no longer holds.
         """
         assert row_count(session, f"SELECT * FROM {TABLE}") == ROW_COUNT
+
+
+@pytest.mark.parametrize(
+    "narrow, wide, before, after, hit, total",
+    [
+        pytest.param(pa.int32(), "long", [1, 2, 3], [10], "x = 2", 16, id="int-to-long"),
+        pytest.param(pa.float32(), "double", [1.5, 2.5], [9.5], "x = 2.5", 13.5, id="float-to-double"),
+    ],
+)
+def test_a_widened_column_still_reads(tmp_path, narrow, wide, before, after, hit, total):
+    """Iceberg allows int -> long and float -> double. Files written before the
+    change keep 4-byte bounds; decoding them at the new 8-byte width failed every
+    read of the table, not only reads of the widened column."""
+    from pyiceberg.types import DoubleType
+    from pyiceberg.types import LongType
+
+    workspace = f"widened_{wide}"
+    warehouse = tmp_path / "warehouse"
+    warehouse.mkdir()
+    props = {"uri": f"sqlite:///{tmp_path / 'catalog.db'}", "warehouse": f"file://{warehouse}"}
+    writer = SqlCatalog(workspace, **props)
+    writer.create_namespace("ns")
+    table = writer.create_table("ns.t", schema=pa.schema([("x", narrow)]))
+    table.append(pa.table({"x": pa.array(before, narrow)}))
+    with table.update_schema() as update:
+        update.update_column("x", field_type=LongType() if wide == "long" else DoubleType())
+    widened = pa.int64() if wide == "long" else pa.float64()
+    writer.load_table("ns.t").append(pa.table({"x": pa.array(after, widened)}))
+
+    register_workspace(workspace, OpteryxConnector, catalog=IcebergMetastore, catalog_type="sql", **props)
+    session = opteryx.session(user="tests")
+    table_name = f"{workspace}.ns.t"
+    assert column(session, f"SELECT SUM(x) AS total FROM {table_name}", "total") == [total]
+    assert row_count(session, f"SELECT * FROM {table_name} WHERE {hit}") == 1
