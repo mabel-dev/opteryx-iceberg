@@ -27,7 +27,7 @@ urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
 requires-python = ">=3.11"
 dependencies = [
     "opteryx-catalog>=0.4.196",
-    "opteryx-core>=0.9.195",
+    "opteryx-core>=0.9.197",
     "pyiceberg==0.12.0rc1",
 ]
 
