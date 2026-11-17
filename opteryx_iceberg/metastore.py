@@ -1,7 +1,8 @@
 """IcebergMetastore: wraps pyiceberg's own catalog loader (REST/SQL/Hive/Glue,
 whichever `catalog_type`/`uri` selects) as an opteryx_catalog Metastore.
 
-Read-only (Tier 1). Registered per-workspace via the existing
+Tier 1 reads; Tier 2 writes CREATE SCHEMA, CREATE TABLE and INSERT INTO ...
+SELECT (opteryx_iceberg.writes). Registered per-workspace via the existing
 `opteryx.connectors.register_workspace(prefix, OpteryxConnector,
 catalog=IcebergMetastore, workspace=..., **iceberg_properties)` seam - no new
 routing mechanism needed.
@@ -10,9 +11,9 @@ Duck-type surface: OpteryxConnector calls a wider set of catalog methods than
 the formal `Metastore` ABC (see opteryx-core/opteryx/connectors/
 opteryx_connector.py). `load_dataset`, `get_relation`, `dataset_exists`,
 `list_datasets`, and `load_view` are implemented for real, since they sit on
-the plain-SELECT read path. Everything DDL/write/materialized-view/trigger-
-shaped raises NotImplementedError - none of it applies to an external,
-read-only Iceberg source, and Tier 2 is where writes belong.
+the plain-SELECT read path. `create_collection` and `create_dataset` are
+implemented; every other DDL/write/materialized-view/trigger-shaped call
+(DROP, RENAME, CTAS, ...) raises NotImplementedError.
 """
 
 from __future__ import annotations
@@ -269,10 +270,48 @@ class IcebergMetastore(Metastore):
         except (NoSuchTableError, NoSuchNamespaceError) as exc:
             raise DatasetNotFound(identifier) from exc
 
-    def create_dataset(self, identifier: str, schema, properties=None, author=None):
+    def create_dataset(self, identifier: str, schema, properties=None, author=None, location=None):
+        """CREATE TABLE: a format-version 2, unpartitioned, unsorted Iceberg
+        table with default properties (opteryx_iceberg.writes). Iceberg records
+        no author. A `location` is a CTAS's pending writers' - CTAS is not
+        supported, so it is refused rather than ignored."""
+        from opteryx_catalog.exceptions import DatasetAlreadyExists
+        from pyiceberg.exceptions import TableAlreadyExistsError
+
+        from opteryx_iceberg.writes import FORMAT_VERSION
+        from opteryx_iceberg.writes import iceberg_schema
+
+        if location is not None:
+            raise NotImplementedError(
+                "opteryx-iceberg does not support CREATE TABLE ... AS SELECT - CREATE TABLE, "
+                "then INSERT INTO ... SELECT."
+            )
+        if properties:
+            raise NotImplementedError(
+                f"opteryx-iceberg creates tables with default properties only (got {properties!r})."
+            )
+        if schema is None:
+            raise ValueError(f"opteryx-iceberg: CREATE TABLE {identifier} needs a schema.")
+        try:
+            self._catalog.create_table(
+                self._to_iceberg_identifier(identifier),
+                schema=iceberg_schema(schema),
+                properties={"format-version": str(FORMAT_VERSION)},
+            )
+        except TableAlreadyExistsError as exc:
+            raise DatasetAlreadyExists(f"Dataset already exists: {identifier}") from exc
+        return self.load_dataset(identifier)
+
+    def open_pending_data_file_writer(self, identifier: str, *args, **kwargs):
+        # The first call a CTAS makes, before any table exists.
         raise NotImplementedError(
-            "opteryx-iceberg (Tier 1) is read-only - writing is Tier 2 scope."
+            "opteryx-iceberg does not support CREATE TABLE ... AS SELECT - CREATE TABLE, "
+            "then INSERT INTO ... SELECT."
         )
+
+    def list_vector_indexes(self, identifier: str) -> list:
+        # Iceberg has no vector indexes; the engine asks before every INSERT.
+        return []
 
     def drop_dataset(self, identifier: str, author: str | None = None) -> None:
         raise NotImplementedError(
@@ -290,9 +329,10 @@ class IcebergMetastore(Metastore):
         )
 
     def create_collection(self, namespace: str, exists_ok: bool = False, author=None) -> None:
-        raise NotImplementedError(
-            "opteryx-iceberg (Tier 1) is read-only - writing is Tier 2 scope."
-        )
+        if exists_ok:
+            self._catalog.create_namespace_if_not_exists(self._to_iceberg_namespace(namespace))
+        else:
+            self._catalog.create_namespace(self._to_iceberg_namespace(namespace))
 
     def drop_collection(self, namespace: str, author=None) -> None:
         raise NotImplementedError(

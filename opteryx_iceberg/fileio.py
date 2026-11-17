@@ -25,11 +25,16 @@ properties. Where the properties name a different S3 endpoint or access key,
 or carry a vended GCS token, the read is refused rather than silently served
 under a different identity.
 
-Read-only: nothing is written through either surface.
+Writes (Tier 2: CREATE TABLE / INSERT) go through the same two surfaces:
+local files directly, S3 and GCS through opteryx_catalog's own FileIO
+(opteryx-core's filesystems are read-only) built with opteryx-core's S3
+endpoint and credentials, so a write runs under the identity reads do. The
+same identity check refuses a write the properties expect elsewhere.
 """
 
 from __future__ import annotations
 
+import os
 import threading
 from io import BytesIO
 from typing import BinaryIO
@@ -37,6 +42,7 @@ from typing import BinaryIO
 from opteryx.connectors.io_systems import create_filesystem
 from opteryx_catalog.iops.base import FileIO
 from opteryx_catalog.iops.base import InputFile as BaseInputFile
+from opteryx_catalog.iops.base import OutputFile as BaseOutputFile
 from pyiceberg.io import FileIO as PyIcebergFileIO
 from pyiceberg.io import InputFile as PyIcebergInputFile
 from pyiceberg.io import InputStream
@@ -139,6 +145,107 @@ class _ObjectReader:
             handle.close()
 
 
+class _LocalOutputStream:
+    """A local file written to a sibling temp path and renamed into place on
+    close, so a reader never sees a partial file; abort removes the temp."""
+
+    def __init__(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._path = path
+        self._temp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        self._handle = open(self._temp, "wb")
+
+    def write(self, data) -> int:
+        return self._handle.write(data)
+
+    def close(self) -> None:
+        if self._handle.closed:
+            return
+        self._handle.close()
+        os.replace(self._temp, self._path)
+
+    def abort(self) -> None:
+        if not self._handle.closed:
+            self._handle.close()
+        os.unlink(self._temp)
+
+
+_catalog_ios: dict = {}
+_catalog_ios_lock = threading.Lock()
+
+
+def _catalog_io(protocol: str):
+    """The process's one opteryx_catalog FileIO that writes `protocol`, under
+    the identity opteryx-core reads it with: opteryx-core's filesystems are
+    read-only, and the catalog's own FileIO is what the native catalog writes
+    through."""
+    with _catalog_ios_lock:
+        io = _catalog_ios.get(protocol)
+        if io is not None:
+            return io
+        if protocol == "s3":
+            from botocore.config import Config
+            from opteryx_catalog.iops.s3 import S3FileIO
+
+            filesystem = _filesystem("s3")
+            access_key, secret_key, token = filesystem.credentials.frozen()
+            # shortcut: credentials are frozen when the client is built; a
+            # rotating session token outlives no process restart - resolve per
+            # request if a long-lived writer needs it.
+            io = S3FileIO(
+                endpoint_url=filesystem.endpoint or None,
+                region_name=filesystem.region,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                aws_session_token=token,
+                config=Config(s3={"addressing_style": "path" if filesystem.endpoint else "auto"}),
+            )
+        elif protocol == "gs":
+            from opteryx_catalog.iops.gcs import GcsFileIO
+
+            io = GcsFileIO()
+        else:
+            raise ValueError(f"opteryx-iceberg has no catalog FileIO for protocol {protocol!r}")
+        _catalog_ios[protocol] = io
+        return io
+
+
+class _ObjectWriter:
+    """Writes, existence checks and deletes for one set of Iceberg properties,
+    refused under the same identity check as reads."""
+
+    def __init__(self, properties: dict):
+        self.properties = properties
+        self._checked: set = set()
+
+    def _target(self, location: str) -> tuple[str, str]:
+        protocol, path = _resolve(location)
+        if protocol != "file" and protocol not in self._checked:
+            _check_identity(protocol, _filesystem(protocol), self.properties)
+            self._checked.add(protocol)
+        return protocol, path
+
+    def open(self, location: str):
+        """A stream with write / close / abort; nothing is visible until close."""
+        protocol, path = self._target(location)
+        if protocol == "file":
+            return _LocalOutputStream(path)
+        return _catalog_io(protocol).new_output(path).create()
+
+    def exists(self, location: str) -> bool:
+        protocol, path = self._target(location)
+        if protocol == "file":
+            return os.path.exists(path)
+        return _catalog_io(protocol).exists(path)
+
+    def delete(self, location: str) -> None:
+        protocol, path = self._target(location)
+        if protocol == "file":
+            os.unlink(path)
+        else:
+            _catalog_io(protocol).delete(path)
+
+
 # ── pyiceberg surface ────────────────────────────────────────────────────────
 
 
@@ -179,12 +286,55 @@ class OpteryxFileIO(PyIcebergFileIO):
         return OpteryxInputFile(location, self._reader)
 
     def new_output(self, location: str) -> PyIcebergOutputFile:
-        raise NotImplementedError(
-            f"opteryx-iceberg is read-only; refusing to write {location!r}."
-        )
+        return OpteryxOutputFile(location, _ObjectWriter(dict(self.properties)))
 
-    def delete(self, location) -> None:
-        raise NotImplementedError("opteryx-iceberg is read-only; refusing to delete.")
+    def delete(self, location: str) -> None:
+        _ObjectWriter(dict(self.properties)).delete(location)
+
+
+class _PyIcebergOutputStream:
+    """pyiceberg's OutputStream protocol over one catalog/local write stream."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data: bytes) -> int:
+        return self._stream.write(data)
+
+    def close(self) -> None:
+        self._stream.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self._stream.close()
+        else:
+            self._stream.abort()
+
+
+class OpteryxOutputFile(PyIcebergOutputFile):
+    """An Iceberg metadata file pyiceberg writes (a SQL/Hive/Glue catalog's
+    metadata.json), through the same writer as data files and manifests."""
+
+    def __init__(self, location: str, writer: "_ObjectWriter"):
+        super().__init__(location)
+        self._writer = writer
+
+    def __len__(self) -> int:
+        raise NotImplementedError("opteryx-iceberg output files do not report a length.")
+
+    def exists(self) -> bool:
+        return self._writer.exists(self.location)
+
+    def to_input_file(self) -> OpteryxInputFile:
+        return OpteryxInputFile(self.location, _ObjectReader(self._writer.properties))
+
+    def create(self, overwrite: bool = False) -> _PyIcebergOutputStream:
+        if not overwrite and self._writer.exists(self.location):
+            raise FileExistsError(f"refusing to overwrite {self.location!r}")
+        return _PyIcebergOutputStream(self._writer.open(self.location))
 
 
 # ── opteryx_catalog surface ──────────────────────────────────────────────────
@@ -204,11 +354,22 @@ class IcebergFileIO(FileIO):
 
     def __init__(self, properties: dict | None = None):
         self._reader = _ObjectReader(dict(properties or {}))
+        self._writer = _ObjectWriter(dict(properties or {}))
 
     def new_input(self, location: str) -> IcebergInputFile:
         return IcebergInputFile(location, self._reader)
 
-    def new_output(self, location: str):
-        raise NotImplementedError(
-            f"opteryx-iceberg is read-only; refusing to write {location!r}."
-        )
+    def new_output(self, location: str) -> "IcebergOutputFile":
+        return IcebergOutputFile(location, self._writer)
+
+    def delete(self, location: str) -> None:
+        self._writer.delete(location)
+
+
+class IcebergOutputFile(BaseOutputFile):
+    def __init__(self, location: str, writer: _ObjectWriter):
+        super().__init__(location)
+        self._writer = writer
+
+    def create(self):
+        return self._writer.open(self.location)

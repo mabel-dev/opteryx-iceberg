@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.23"
-description = "Read-only Apache Iceberg Metastore/FileIO backend for Opteryx"
+version = "0.1.24"
+description = "Apache Iceberg Metastore/FileIO backend for Opteryx: reads, CREATE TABLE and INSERT"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
     { name = "joocer", email = "justin.joyce@joocer.com" }

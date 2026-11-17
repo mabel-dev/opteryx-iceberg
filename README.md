@@ -2,7 +2,7 @@
 
 Read-only Apache Iceberg `Metastore`/`FileIO` backend for [opteryx-catalog](https://github.com/mabel-dev/opteryx-catalog), letting an Opteryx workspace query tables from an external Iceberg catalog (REST, SQL, Hive, Glue - whatever [pyiceberg](https://py.iceberg.apache.org/)'s own catalog loader supports) side by side with native Firestore/GCS-backed tables.
 
-This is Tier 1 of Opteryx's Iceberg support: **reads only**. Writing real Iceberg tables from Opteryx (Tier 2) and serving Opteryx's own catalog as an Iceberg REST endpoint (Tier 3) are separate, later work.
+Tier 1 is reads. Tier 2 is writes: `CREATE SCHEMA`, `CREATE TABLE` and `INSERT INTO ... SELECT` (see [Writing](#writing)). Serving Opteryx's own catalog as an Iceberg REST endpoint (Tier 3) is separate, later work.
 
 Kept as its own package - not merged into `opteryx-catalog` or `opteryx-core` - because it depends on `pyiceberg`, which pulls in `pydantic`. Both of those repos are deliberately free of that dependency chain; Iceberg support is optional, the same way `opteryx-access` is.
 
@@ -109,6 +109,17 @@ The counter columns come from the snapshot summary, which Iceberg holds as strin
 - Opteryx's own sketch-based pruning stats (`min_k_hashes`/histograms) — standard Iceberg manifests don't carry them; queries fall back to standard bounds-based pruning.
 - Some nested Iceberg types. A struct, a map with string keys, and a list with a struct or map at the bottom read as JSON text; a list of a plain scalar reads as an ARRAY. A list of lists of a scalar, a map whose keys are not strings, and a list of a scalar with no ARRAY element type are refused by `IcebergDataset.schema()` with the cause named, rather than misrepresented. Note this makes a table with *any* such column unreadable, including for a query that touches only its other columns.
 - Iceberg's own triggers/views listings (`list_views`/`list_triggers` return empty, which is the truthful answer for a Tier 1 reader rather than a stub).
+
+## Writing
+
+`CREATE SCHEMA ws.ns`, `CREATE TABLE ws.ns.t (...)` and `INSERT INTO ws.ns.t SELECT ...` (`opteryx_iceberg/writes.py`):
+
+- Every file is written by rugo: Parquet data files (with the Iceberg field-ids in their schema) under `<table>/data/`, and the Avro manifest and manifest list. pyiceberg is only the catalog client: `create_namespace`, `create_table`, and one `commit_table` per INSERT.
+- An INSERT is an Iceberg fast append: one new manifest of ADDED entries, plus the parent snapshot's manifests carried over. The commit asserts `main` still points at the parent, so a concurrent commit fails the INSERT (`ConcurrentModificationError`), never overwrites.
+- Created tables are format-version 2, unpartitioned, unsorted, default properties. Types: BOOLEAN, INTEGER, BIGINT, REAL, DOUBLE, DATE, microsecond TIMESTAMP, VARCHAR, VARBINARY, UUID, DECIMAL(p ≤ 18); anything else is refused at CREATE TABLE.
+- Bounds are written for numeric, date, timestamp and decimal columns. String, binary and UUID columns get null and value counts but no bounds: the engine's string statistic is an 8-byte prefix key, from which a valid upper bound cannot be rebuilt.
+- Writes go to local files directly and to S3/GCS through opteryx-catalog's FileIO, built with opteryx-core's endpoint and credentials, under the same identity check as reads.
+- Refused by name: CTAS, DROP/RENAME, partitioned tables, nested columns, non-v2 tables, and tables setting `write.data.path`, object-storage layout, or a non-Parquet `write.format.default`.
 
 ## Local development
 

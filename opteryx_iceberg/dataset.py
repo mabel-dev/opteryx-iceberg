@@ -1,6 +1,8 @@
 """IcebergDataset: wraps a pyiceberg.table.Table as an opteryx_catalog Dataset.
 
-Read-only (Tier 1). `append` and any other write path raise NotImplementedError.
+Reads (Tier 1), and INSERT's two write calls (Tier 2): `open_data_file_writer`
+and `add_files` (opteryx_iceberg.writes). `append` and other write paths raise
+NotImplementedError.
 """
 
 from __future__ import annotations
@@ -489,8 +491,53 @@ class IcebergDataset(Dataset):
 
     def append(self, table):
         raise NotImplementedError(
-            "opteryx-iceberg (Tier 1) is read-only - writing is Tier 2 scope."
+            "opteryx-iceberg writes through INSERT INTO ... SELECT (open_data_file_writer + "
+            "add_files), not Dataset.append."
         )
+
+    def open_data_file_writer(
+        self,
+        sorted_by: str | None = None,
+        sorted_descending: bool = False,
+        write_options: dict | None = None,
+        statistics: bool = True,
+    ):
+        """One streamed Parquet data file under `<table location>/data/`, written by
+        rugo with the table's Iceberg field-ids in its schema (opteryx_iceberg.writes)."""
+        from opteryx_iceberg.writes import open_data_file_writer
+
+        return open_data_file_writer(
+            self._table,
+            self._io.properties,
+            sorted_by=sorted_by,
+            sorted_descending=sorted_descending,
+            write_options=write_options,
+            statistics=statistics,
+        )
+
+    def add_files(
+        self,
+        files=None,
+        author=None,
+        commit_message=None,
+        entries=None,
+        manifest: bytes | None = None,
+        index_files=None,
+    ):
+        """INSERT's commit: the files the engine wrote, as `manifest` (the engine's
+        native statistics, keyed by Iceberg field-id), appended as one new Iceberg
+        snapshot (opteryx_iceberg.writes.append_files). Iceberg records no author
+        or commit message."""
+        from opteryx_iceberg.writes import append_files
+
+        if files is not None or entries is not None or manifest is None:
+            raise NotImplementedError(
+                "opteryx-iceberg add_files takes the engine's `manifest` only - not `files` "
+                "or `entries`."
+            )
+        if index_files:
+            raise NotImplementedError("Iceberg tables have no vector indexes to commit.")
+        self._table = append_files(self._table, self._io.properties, manifest)
 
 
 def _reader_path(file_path: str) -> str:

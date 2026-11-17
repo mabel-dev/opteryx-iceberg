@@ -100,17 +100,6 @@ def test_dataset_exists(tmp_path):
     assert metastore.dataset_exists("ns.missing") is False
 
 
-def test_writes_are_not_implemented(tmp_path):
-    _make_catalog(tmp_path)
-    metastore = _make_metastore(tmp_path)
-
-    try:
-        metastore.create_dataset("ns.new", schema=None)
-        raise AssertionError("expected NotImplementedError")
-    except NotImplementedError:
-        pass
-
-
 def test_display_types_preserve_physical_width():
     """Iceberg's 4-byte types must not be declared as 8-byte Opteryx types.
 
