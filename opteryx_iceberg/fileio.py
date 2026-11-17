@@ -184,7 +184,13 @@ def _catalog_io(protocol: str):
         if io is not None:
             return io
         if protocol == "s3":
-            from botocore.config import Config
+            try:
+                from botocore.config import Config
+            except ModuleNotFoundError as err:
+                raise ModuleNotFoundError(
+                    "Writing Iceberg tables to S3 needs boto3: "
+                    "pip install 'opteryx-iceberg[s3]'"
+                ) from err
             from opteryx_catalog.iops.s3 import S3FileIO
 
             filesystem = _filesystem("s3")

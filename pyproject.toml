@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "opteryx-iceberg"
-version = "0.1.24"
+version = "0.1.25"
 description = "Apache Iceberg Metastore/FileIO backend for Opteryx: reads, CREATE TABLE and INSERT"
 readme = { file = "README.md", content-type = "text/markdown" }
 authors = [
@@ -27,12 +27,17 @@ urls = { "Homepage" = "https://github.com/mabel-dev/opteryx-iceberg" }
 requires-python = ">=3.11"
 dependencies = [
     "opteryx-catalog>=0.4.196",
-    "opteryx-core>=0.9.195",
+    "opteryx-core>=0.10.0",
     "pyiceberg==0.12.0rc1",
 ]
 
 [project.optional-dependencies]
+# Writing to S3 goes through opteryx-catalog's S3FileIO, which needs boto3.
+s3 = [
+    "opteryx-catalog[s3]>=0.4.196",
+]
 test = [
+    "opteryx-iceberg[s3]",
     "pytest>=8",
     "pyiceberg[sql-sqlite,pyiceberg-core]==0.12.0rc1",
     "pyarrow",
