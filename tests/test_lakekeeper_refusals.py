@@ -34,7 +34,7 @@ from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
 from pyiceberg.catalog import load_catalog
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 NAMESPACE = f"ci_{uuid.uuid4().hex[:12]}"
 
@@ -71,7 +71,7 @@ def refusing(request):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="rest",
         **_properties(workspace),
     )

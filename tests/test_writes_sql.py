@@ -17,7 +17,7 @@ import opteryx
 from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 WORKSPACE = "ice_writes"
 
@@ -51,7 +51,7 @@ def setup(tmp_path_factory):
     root = tmp_path_factory.mktemp("iceberg-writes")
     (root / "warehouse").mkdir()
     properties = {"uri": f"sqlite:///{root / 'catalog.db'}", "warehouse": f"file://{root / 'warehouse'}"}
-    register_workspace(WORKSPACE, OpteryxConnector, catalog=IcebergMetastore, catalog_type="sql", **properties)
+    register_workspace(WORKSPACE, OpteryxConnector, catalog=UnrestrictedIcebergMetastore, catalog_type="sql", **properties)
     session = opteryx.session(user="tests")
     run(session, f"CREATE SCHEMA {WORKSPACE}.ns")
     run(session, f"CREATE TABLE {WORKSPACE}.ns.t (id BIGINT, name VARCHAR, ts TIMESTAMP, d DATE, x DOUBLE)")

@@ -12,9 +12,13 @@ README for why.
 from .dataset import IcebergDataset
 from .fileio import IcebergFileIO
 from .metastore import IcebergMetastore
+from .metastore import UnrestrictedIcebergMetastore
+from .metastore import check_tenant_properties
 
 __all__ = [
     "IcebergDataset",
     "IcebergFileIO",
     "IcebergMetastore",
+    "UnrestrictedIcebergMetastore",
+    "check_tenant_properties",
 ]

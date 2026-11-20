@@ -40,7 +40,7 @@ from opteryx.connectors.opteryx_connector import OpteryxConnector
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.types import StringType
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 
 def _catalog(tmp_path, workspace):
@@ -57,7 +57,7 @@ def _register(workspace, uri, warehouse_uri):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="sql",
         uri=uri,
         warehouse=warehouse_uri,
@@ -168,7 +168,7 @@ def listed(tmp_path_factory):
     catalog.create_table("ns.t", schema=data.schema).append(data)
     catalog.create_table("ns.u", schema=data.schema).append(data)
     catalog.create_table("other.v", schema=data.schema).append(data)
-    metastore = IcebergMetastore(
+    metastore = UnrestrictedIcebergMetastore(
         workspace="meta", catalog_type="sql", uri=uri, warehouse=warehouse_uri
     )
     return _register("meta", uri, warehouse_uri), metastore

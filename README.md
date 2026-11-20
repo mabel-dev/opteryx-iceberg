@@ -23,7 +23,7 @@ register_workspace(
     "my_iceberg_workspace",
     OpteryxConnector,
     catalog=IcebergMetastore,
-    catalog_type="rest",       # or "sql", "hive", "glue" - anything pyiceberg's loader supports
+    catalog_type="rest",       # IcebergMetastore: "rest" only - see "Catalog properties" below
     uri="https://...",
     warehouse="s3://...",
 )
@@ -33,7 +33,9 @@ Do **not** pass `workspace=` yourself — `OpteryxConnector` injects it automati
 
 Native (Firestore/GCS-backed) workspaces are entirely unaffected - this only applies to workspaces explicitly registered with `catalog=IcebergMetastore`.
 
-**Config passes through to pyiceberg verbatim — nesting included.** Every kwarg after `catalog=` is forwarded untouched to `pyiceberg.catalog.load_catalog`, so pyiceberg's own config shapes (`auth={...}`, `token=`, `credential=`) are used directly. (Earlier versions required flat `auth_type`/`google_auth_scopes` kwargs because opteryx-core's connector cache hashed registration kwargs and a `dict` value broke it; that cache is now keyed by workspace name in opteryx-core's resolution-first connector layer, the flattening is retired, and passing the old flat kwargs raises a clear `ValueError`.)
+**Catalog properties are an allow-list.** `IcebergMetastore` is for configuration a *tenant* supplies (a workspace's catalog binding), so it accepts only `catalog_type="rest"` and the properties `uri` (https), `warehouse`, `token`, `credential`, `scope`, `oauth2-server-uri` (https), `header.X-Iceberg-Access-Delegation`, `header.x-goog-user-project`, and `auth={"type": "google", "google": {"scopes": [...]}}` with a `uri` under `https://biglake.googleapis.com/`. Anything else raises `ValueError` before pyiceberg sees it: pyiceberg imports and calls the class an `auth.impl` or `py-*-impl` names, and its Google auth manager sends the process's own token to whatever `uri` says. `check_tenant_properties(catalog_type, properties)` is the same check, for a binding writer to refuse a config before storing it. A REST catalog's server cannot widen this either: a `/v1/config` response that changes `uri`, `auth`, `ssl`, the token/credential/OAuth keys, or any `header.*`, `rest.*`, `client.*` or `py-*` key is refused, and a table's FileIO is always `OpteryxFileIO` whatever `py-io-impl` the table's properties or load-table config name.
+
+`UnrestrictedIcebergMetastore` takes any catalog type (`sql`, `hive`, `glue`, ...) and any pyiceberg property, passed through as given, and is only for configuration the deployment's *operator* writes - a self-hosted box's environment, a script, this repo's tests - never a binding a workspace owner can edit. (Flat `auth_type`/`google_auth_scopes` kwargs, retired when opteryx-core's connector cache stopped hashing registration kwargs, raise a clear `ValueError` on both classes.)
 
 ### Google auth (BigLake and other Google-fronted REST catalogs)
 
@@ -69,7 +71,7 @@ So when pointing Opteryx at a local/SQL Iceberg catalog, whoever wrote the table
 SqlCatalog("my_workspace", uri="sqlite:///.../catalog.db", warehouse="file:///...")
 
 # reader - the prefix here becomes the pyiceberg catalog name
-register_workspace("my_workspace", OpteryxConnector, catalog=IcebergMetastore, catalog_type="sql", ...)
+register_workspace("my_workspace", OpteryxConnector, catalog=UnrestrictedIcebergMetastore, catalog_type="sql", ...)
 ```
 
 If you already have a SQL catalog written under a different name, either register the Opteryx workspace under that name or rewrite the `catalog_name` values in the catalog's metadata table.

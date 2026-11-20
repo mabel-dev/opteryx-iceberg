@@ -15,7 +15,7 @@ from opteryx_catalog.catalog.dataset import Datafile
 from opteryx_catalog.exceptions import DatasetNotFound
 from pyiceberg.catalog.sql import SqlCatalog
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 
 def _make_catalog(tmp_path):
@@ -36,7 +36,7 @@ def _make_catalog(tmp_path):
 
 
 def _make_metastore(tmp_path):
-    return IcebergMetastore(
+    return UnrestrictedIcebergMetastore(
         workspace="test",
         catalog_type="sql",
         uri=f"sqlite:///{tmp_path / 'catalog.db'}",

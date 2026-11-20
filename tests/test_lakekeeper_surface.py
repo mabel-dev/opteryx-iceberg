@@ -46,7 +46,7 @@ from pyiceberg.types import NestedField
 from pyiceberg.types import StringType
 from pyiceberg.types import TimestampType
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 RUN = f"ci_{uuid.uuid4().hex[:12]}"
 MAIN = f"{RUN}_surface"
@@ -137,7 +137,7 @@ def surface(request):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="rest",
         **rest_properties(workspace),
     )

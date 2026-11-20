@@ -50,7 +50,7 @@ import opteryx
 from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 CORE_ROOT = os.environ.get("OPTERYX_CORE_ROOT")
 if not CORE_ROOT:
@@ -289,7 +289,7 @@ def warehouse(request):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="rest",
         **rest_properties(workspace),
     )

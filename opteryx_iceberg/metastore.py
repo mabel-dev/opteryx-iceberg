@@ -19,22 +19,143 @@ implemented; every other DDL/write/materialized-view/trigger-shaped call
 from __future__ import annotations
 
 from collections.abc import Iterable
+from urllib.parse import urlsplit
 
 from opteryx_catalog.catalog.metastore import Metastore
 from opteryx_catalog.exceptions import DatasetNotFound
 from opteryx_catalog.exceptions import TagNotFound
 from pyiceberg.catalog import load_catalog
+from pyiceberg.catalog.rest import RestCatalog
 from pyiceberg.exceptions import NoSuchNamespaceError
 from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.table.refs import SnapshotRefType
+from pyiceberg.typedef import EMPTY_DICT
 
 from opteryx_iceberg.dataset import IcebergDataset
 from opteryx_iceberg.fileio import PY_IO_IMPL
 from opteryx_iceberg.fileio import IcebergFileIO
 from opteryx_iceberg.fileio import OpteryxFileIO
 
+# The catalog properties IcebergMetastore accepts - everything a workspace's
+# catalog binding can carry, decided from what the hosted product offers
+# (control.opteryx's catalog-kinds descriptor and the "Connecting an Iceberg
+# Catalog" guide): a REST catalog's address and warehouse, a stored bearer
+# token or OAuth2 client credential, Polaris' scope and token endpoint, two
+# documented headers, and Google auth to BigLake. Anything else is REFUSED,
+# never dropped: pyiceberg imports and calls classes named in its config
+# (`auth.impl`, `py-*-impl`), sends ambient credentials to whatever `uri` says
+# (`auth.type`), and reads local files (`ssl`, `auth.google.credentials_path`).
+TENANT_PROPERTIES = frozenset(
+    {"uri", "warehouse", "token", "credential", "scope", "oauth2-server-uri", "auth"}
+)
+# Header names are case-insensitive, so a `header.<Name>` key is compared lowercased.
+TENANT_HEADERS = frozenset({"header.x-iceberg-access-delegation", "header.x-goog-user-project"})
+# Ambient Google credentials go to this address and nowhere else. A string prefix,
+# not a parsed hostname, so no URL-parser differential can move the token.
+GOOGLE_AUTH_URI_PREFIX = "https://biglake.googleapis.com/"
+
+# Properties pyiceberg uses to address, authenticate or load code for its REST
+# session. A REST server's /v1/config `defaults` and `overrides` are merged into
+# the client's properties BEFORE that session is built, so without this check the
+# server - an address the binding chose - could set `auth.type=custom` itself.
+_TRANSPORT_KEYS = frozenset(
+    {
+        "uri",
+        "auth",
+        "ssl",
+        "token",
+        "credential",
+        "scope",
+        "audience",
+        "resource",
+        "oauth2-server-uri",
+        "botocore_session",
+    }
+)
+_TRANSPORT_PREFIXES = ("header.", "rest.", "client.", "py-")
+
+
+def _require_https(name: str, value: str) -> None:
+    parts = urlsplit(value)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError(f"opteryx-iceberg: {name!r} must be an https:// address with a host.")
+
+
+def check_tenant_properties(catalog_type: str, properties: dict) -> None:
+    """Raise ValueError unless `properties` are a catalog binding IcebergMetastore accepts.
+
+    Exposed so a binding WRITER can refuse a config before storing it; the
+    metastore runs it again on every construction regardless.
+    """
+    if catalog_type != "rest":
+        raise ValueError(
+            f"opteryx-iceberg: catalog type {catalog_type!r} is not supported - only 'rest'."
+        )
+    refused = sorted(
+        key for key in properties if key not in TENANT_PROPERTIES and key.lower() not in TENANT_HEADERS
+    )
+    if refused:
+        raise ValueError(
+            f"opteryx-iceberg: catalog properties {refused} are not allowed "
+            f"(allowed: {sorted(TENANT_PROPERTIES | TENANT_HEADERS)})."
+        )
+    if "uri" not in properties:
+        raise ValueError("opteryx-iceberg: a REST catalog binding needs a 'uri'.")
+    _require_https("uri", properties["uri"])
+    if "oauth2-server-uri" in properties:
+        _require_https("oauth2-server-uri", properties["oauth2-server-uri"])
+    if "auth" in properties:
+        auth = properties["auth"]
+        if not ({"type"} <= set(auth) <= {"type", "google"}) or auth["type"] != "google":
+            raise ValueError(
+                'opteryx-iceberg: the only supported auth is {"type": "google", '
+                '"google": {"scopes": [...]}}.'
+            )
+        if "google" in auth and set(auth["google"]) - {"scopes"}:
+            raise ValueError("opteryx-iceberg: Google auth accepts only 'scopes'.")
+        if not str(properties["uri"]).startswith(GOOGLE_AUTH_URI_PREFIX):
+            raise ValueError(
+                f"opteryx-iceberg: Google auth is only sent to {GOOGLE_AUTH_URI_PREFIX} - "
+                "Opteryx's own identity is not presented to any other catalog."
+            )
+
+
+class _GuardedRestCatalog(RestCatalog):
+    """pyiceberg's RestCatalog, minus the server's ability to reconfigure the client."""
+
+    def _fetch_config(self) -> None:
+        configured = dict(self.properties)
+        super()._fetch_config()
+        served = sorted(
+            key
+            for key in configured.keys() | self.properties.keys()
+            if (key in _TRANSPORT_KEYS or key.startswith(_TRANSPORT_PREFIXES))
+            and configured.get(key) != self.properties.get(key)
+        )
+        if served:
+            raise ValueError(
+                f"opteryx-iceberg: the REST catalog's /v1/config tried to set {served}. A catalog "
+                "server may not change how Opteryx addresses, authenticates to, or loads code for it."
+            )
+
+    def _load_file_io(self, properties=EMPTY_DICT, location=None):
+        # A table's FileIO is built from the catalog's properties under the table's
+        # metadata properties and the load-table `config` - all of which the catalog's
+        # owner writes - and pyiceberg imports and calls whatever `py-io-impl` that
+        # names. Iceberg metadata is read through OpteryxFileIO whatever is served
+        # (see IcebergMetastore.load_dataset), so it is fixed here too.
+        return super()._load_file_io({**properties, "py-io-impl": PY_IO_IMPL}, location)
+
 
 class IcebergMetastore(Metastore):
+    """An Iceberg catalog as an opteryx_catalog Metastore, for configuration a
+    TENANT supplies - a workspace's catalog binding. Properties are checked
+    against `check_tenant_properties` before pyiceberg sees them.
+
+    `UnrestrictedIcebergMetastore` is the same class without that check, for
+    configuration only the deployment's operator can write.
+    """
+
     # The workspace's opteryx catalog entry holds only a LISTING of each
     # Iceberg table (name and columns, no snapshot, no files); the table itself
     # is read from Iceberg. Declared explicitly rather than inherited - see
@@ -47,6 +168,10 @@ class IcebergMetastore(Metastore):
         catalog_type: str = "rest",
         **properties,
     ):
+        check_tenant_properties(catalog_type, properties)
+        self._open(workspace, catalog_type, properties)
+
+    def _open(self, workspace: str, catalog_type: str, properties: dict) -> None:
         """
         Args:
             workspace: the Opteryx workspace prefix this instance was
@@ -66,13 +191,15 @@ class IcebergMetastore(Metastore):
                 same catalog name as the Opteryx workspace prefix it is
                 registered under.
             catalog_type: pyiceberg catalog type ("rest", "sql", "hive",
-                "glue", ...) - passed through as `properties["type"]`.
-            **properties: forwarded VERBATIM to
-                `pyiceberg.catalog.load_catalog` (e.g. `uri`, `warehouse`,
-                `token`, `credential`, `auth={...}`). Values may be
-                arbitrarily nested - pyiceberg's own config shapes, such
-                as `auth={"type": "google", "google": {"scopes": [...]}}`,
-                are used directly.
+                "glue", ...). Only "rest" passes `check_tenant_properties`.
+            properties: forwarded to pyiceberg (e.g. `uri`, `warehouse`,
+                `token`, `credential`, `auth={...}`), which IcebergMetastore
+                has already checked. Values may be nested - pyiceberg's own
+                config shapes, such as
+                `auth={"type": "google", "google": {"scopes": [...]}}`, are
+                used directly. A REST catalog is built as
+                `_GuardedRestCatalog`, so what its server serves cannot
+                reconfigure the client or name the table FileIO.
 
         This class used to accept flat `auth_type`/`google_auth_scopes`
         kwargs and rebuild pyiceberg's nested `auth` dict internally,
@@ -103,7 +230,10 @@ class IcebergMetastore(Metastore):
             )
         self.workspace = workspace
         iceberg_properties = {"py-io-impl": PY_IO_IMPL, **properties}
-        self._catalog = load_catalog(workspace, type=catalog_type, **iceberg_properties)
+        if catalog_type == "rest":
+            self._catalog = _GuardedRestCatalog(workspace, **iceberg_properties)
+        else:
+            self._catalog = load_catalog(workspace, type=catalog_type, **iceberg_properties)
         self.io = IcebergFileIO(properties)
 
     def load_dataset(self, identifier: str, load_history: bool = False) -> IcebergDataset:
@@ -348,3 +478,19 @@ class IcebergMetastore(Metastore):
     @staticmethod
     def _to_iceberg_namespace(namespace: str) -> tuple:
         return tuple(namespace.split("."))
+
+
+class UnrestrictedIcebergMetastore(IcebergMetastore):
+    """IcebergMetastore without `check_tenant_properties`: any catalog type and
+    any pyiceberg property, including ones that load code or present ambient
+    credentials. ONLY for configuration the deployment's operator writes (a
+    self-hosted box's environment, a script, a test) - never for a binding a
+    workspace owner can edit. A REST catalog is still `_GuardedRestCatalog`."""
+
+    def __init__(
+        self,
+        workspace: str,
+        catalog_type: str = "rest",
+        **properties,
+    ):
+        self._open(workspace, catalog_type, properties)

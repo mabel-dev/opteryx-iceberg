@@ -46,7 +46,7 @@ import opteryx
 from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 from opteryx_iceberg import fileio
 
 NAMESPACE = f"ci_{uuid.uuid4().hex[:12]}"
@@ -91,7 +91,7 @@ def fixture(request):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="rest",
         **rest_properties(workspace),
     )
@@ -147,7 +147,7 @@ class TestMetadataIsReadThroughOpteryxCore:
 
         monkeypatch.setattr(fileio._ObjectReader, "read", spy)
         workspace = fixture["workspace"]
-        dataset = IcebergMetastore(
+        dataset = UnrestrictedIcebergMetastore(
             workspace, catalog_type="rest", **rest_properties(workspace)
         ).load_dataset(f"{NAMESPACE}.t")
 

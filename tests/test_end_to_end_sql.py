@@ -57,7 +57,7 @@ import opteryx
 from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 from opteryx_iceberg.dataset import IcebergDataset
 
 # The pyiceberg catalog NAME must equal the Opteryx workspace prefix:
@@ -135,7 +135,7 @@ def session(tmp_path_factory):
     register_workspace(
         WORKSPACE,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="sql",
         uri=uri,
         warehouse=warehouse_uri,
@@ -284,7 +284,7 @@ def test_a_widened_column_still_reads(tmp_path, narrow, wide, before, after, hit
     widened = pa.int64() if wide == "long" else pa.float64()
     writer.load_table("ns.t").append(pa.table({"x": pa.array(after, widened)}))
 
-    register_workspace(workspace, OpteryxConnector, catalog=IcebergMetastore, catalog_type="sql", **props)
+    register_workspace(workspace, OpteryxConnector, catalog=UnrestrictedIcebergMetastore, catalog_type="sql", **props)
     session = opteryx.session(user="tests")
     table_name = f"{workspace}.ns.t"
     assert column(session, f"SELECT SUM(x) AS total FROM {table_name}", "total") == [total]

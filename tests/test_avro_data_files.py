@@ -40,7 +40,7 @@ from opteryx.exceptions import DatasetReadError
 from opteryx.exceptions import NotSupportedError
 from opteryx.models.dataset_format import MixedFormatDatasetError
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 
 UTC = datetime.timezone.utc
 _workspaces = itertools.count()
@@ -113,7 +113,7 @@ class Env:
         register_workspace(
             self.workspace,
             OpteryxConnector,
-            catalog=IcebergMetastore,
+            catalog=UnrestrictedIcebergMetastore,
             catalog_type="sql",
             uri=uri,
             warehouse=warehouse,

@@ -33,7 +33,7 @@ import opteryx
 from opteryx.connectors import register_workspace
 from opteryx.connectors.opteryx_connector import OpteryxConnector
 
-from opteryx_iceberg import IcebergMetastore
+from opteryx_iceberg import UnrestrictedIcebergMetastore
 from opteryx_iceberg.dataset import IcebergSnapshot
 
 # The pyiceberg catalog NAME must equal the Opteryx workspace prefix - see the
@@ -75,7 +75,7 @@ def fixture(tmp_path_factory):
     register_workspace(
         WORKSPACE,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="sql",
         uri=uri,
         warehouse=warehouse_uri,
@@ -287,7 +287,7 @@ def deleted(tmp_path_factory):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="sql",
         uri=uri,
         warehouse=warehouse_uri,
@@ -363,7 +363,7 @@ def tagged(tmp_path_factory):
     register_workspace(
         workspace,
         OpteryxConnector,
-        catalog=IcebergMetastore,
+        catalog=UnrestrictedIcebergMetastore,
         catalog_type="sql",
         uri=uri,
         warehouse=warehouse_uri,
