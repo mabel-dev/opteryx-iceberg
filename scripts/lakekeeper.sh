@@ -45,7 +45,10 @@ DB=opteryx-iceberg-lk-db
 S3=opteryx-iceberg-lk-s3
 CATALOG=opteryx-iceberg-lk-catalog
 
-PG_URL="postgresql://postgres:postgres@localhost:5432/postgres"
+# The disposable Postgres container's password, set on the container and used in
+# the URL from this one variable.
+PG_PASSWORD="opteryx-iceberg-ci-not-a-secret"
+PG_URL="postgresql://postgres:${PG_PASSWORD}@localhost:5432/postgres"
 # Lakekeeper encrypts stored warehouse credentials with this; the stack is
 # disposable, so a fixed key is fine.
 PG_ENCRYPTION_KEY="opteryx-iceberg-ci-not-a-secret"
@@ -71,7 +74,7 @@ up() {
     : "${AWS_ACCESS_KEY_ID:?}" "${AWS_SECRET_ACCESS_KEY:?}" "${AWS_REGION:?}"
 
     docker run -d --name "$DB" --network host \
-        -e POSTGRES_PASSWORD=postgres \
+        -e POSTGRES_PASSWORD="$PG_PASSWORD" \
         "$POSTGRES_IMAGE"
     # Over TCP, not the socket: initdb's temporary server answers on the
     # socket only, then restarts - a socket probe can pass before the real one.
