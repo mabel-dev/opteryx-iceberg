@@ -30,11 +30,21 @@ local files directly, S3 and GCS through opteryx_catalog's own FileIO
 (opteryx-core's filesystems are read-only) built with opteryx-core's S3
 endpoint and credentials, so a write runs under the identity reads do. The
 same identity check refuses a write the properties expect elsewhere.
+
+Because every read and write runs as Opteryx, a location is opened with
+Opteryx's access, not with the access of whoever wrote the catalog. A TENANT's
+catalog (IcebergMetastore) is therefore held to `TenantLocations`: gs:// and
+s3:// objects only, and none in a bucket the deployment reserves - otherwise a
+workspace's catalog could name the worker's own disk, or another workspace's
+native data, and have Opteryx read it for them. `TenantFileIO` is the FileIO
+that carries it; an operator's catalog (UnrestrictedIcebergMetastore) uses
+`OpteryxFileIO`, which admits every location the reader supports.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import threading
 from io import BytesIO
 from typing import BinaryIO
@@ -50,8 +60,23 @@ from pyiceberg.io import OutputFile as PyIcebergOutputFile
 
 from opteryx_iceberg.dataset import _reader_path
 
-# pyiceberg's `py-io-impl` value for OpteryxFileIO - see IcebergMetastore.
+# pyiceberg's `py-io-impl` values: OpteryxFileIO for an operator's catalog,
+# TenantFileIO for a tenant's - see IcebergMetastore.
 PY_IO_IMPL = "opteryx_iceberg.fileio.OpteryxFileIO"
+TENANT_PY_IO_IMPL = "opteryx_iceberg.fileio.TenantFileIO"
+
+# The buckets this deployment owns - its native catalog's data, query results,
+# scratch: anything Opteryx's identity can read that is not a customer's lake -
+# as a comma-separated list of `gs://<bucket>` / `s3://<bucket>`. Required for a
+# tenant's catalog to be read at all: an unset list would mean no bucket is
+# protected, so it is refused rather than assumed empty.
+RESERVED_BUCKETS_ENV = "OPTERYX_ICEBERG_RESERVED_BUCKETS"
+
+# A bucket name as GCS and S3 accept it: lowercase letters, digits, dots, dashes
+# and underscores, alphanumeric at both ends. Anything else - a capital, a
+# percent-escape, a userinfo `@`, an empty name - is refused, never normalised,
+# so the name compared against the reserved list is the name the store resolves.
+_BUCKET_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]")
 
 # Location scheme -> the opteryx-core filesystem protocol that reads it.
 _PROTOCOL_BY_SCHEME = {
@@ -125,14 +150,96 @@ def _check_identity(protocol: str, filesystem, properties: dict) -> None:
         )
 
 
-class _ObjectReader:
-    """Whole-object reads for one set of Iceberg properties."""
+# ── which locations a catalog may name ───────────────────────────────────────
 
-    def __init__(self, properties: dict):
+
+def _object_bucket(location: str) -> tuple[str, str] | None:
+    """(protocol, bucket) for a gs:// or s3:// location, None for any other.
+    Raises ValueError for an object location whose bucket is not a valid name."""
+    scheme, separator, remainder = location.partition("://")
+    protocol = _PROTOCOL_BY_SCHEME.get(scheme) if separator else None
+    if protocol not in ("gs", "s3"):
+        return None
+    bucket = remainder.partition("/")[0]
+    if not _BUCKET_NAME.fullmatch(bucket):
+        raise ValueError(f"{location!r} does not name a valid {protocol}:// bucket")
+    return protocol, bucket
+
+
+def _reserved_buckets() -> frozenset:
+    """The deployment's reserved buckets, as (protocol, bucket), from RESERVED_BUCKETS_ENV."""
+    if RESERVED_BUCKETS_ENV not in os.environ:
+        raise RuntimeError(
+            f"{RESERVED_BUCKETS_ENV} is not set. A workspace's Iceberg catalog is read with "
+            "Opteryx's own identity, so it cannot be read until the deployment names the "
+            "buckets that identity must not be pointed at (comma-separated gs://<bucket> / "
+            "s3://<bucket>)."
+        )
+    reserved = set()
+    for entry in os.environ[RESERVED_BUCKETS_ENV].split(","):
+        entry = entry.strip()
+        scheme, separator, bucket = entry.partition("://")
+        if (
+            not separator
+            or _PROTOCOL_BY_SCHEME.get(scheme) not in ("gs", "s3")
+            or not _BUCKET_NAME.fullmatch(bucket)
+        ):
+            raise RuntimeError(
+                f"{RESERVED_BUCKETS_ENV}: {entry!r} is not gs://<bucket> or s3://<bucket>."
+            )
+        reserved.add((_PROTOCOL_BY_SCHEME[scheme], bucket))
+    return frozenset(reserved)
+
+
+class AnyLocation:
+    """An OPERATOR's catalog may name every location the reader supports."""
+
+    def check(self, location: str) -> None:
+        return None
+
+
+class TenantLocations:
+    """A TENANT's catalog may name gs:// and s3:// objects outside the
+    deployment's reserved buckets, and nothing else.
+
+    Every location is opened as Opteryx (see the module docstring). A local path
+    would be read from the worker's own disk, and a reserved bucket holds data
+    that belongs to other workspaces or to Opteryx - both readable by Opteryx's
+    identity, neither the tenant's. A stopgap: a customer bucket granted to
+    Opteryx's shared identity is still reachable from any tenant's catalog until
+    each workspace reads under an identity of its own.
+    """
+
+    def __init__(self):
+        self._reserved: frozenset | None = None
+
+    def check(self, location: str) -> None:
+        bucket = _object_bucket(location)
+        if bucket is None:
+            raise PermissionError(
+                f"opteryx-iceberg refuses {location!r}: a workspace's catalog may only name "
+                "gs:// or s3:// locations."
+            )
+        if self._reserved is None:
+            self._reserved = _reserved_buckets()
+        if bucket in self._reserved:
+            raise PermissionError(
+                f"opteryx-iceberg refuses {location!r}: that bucket belongs to this "
+                "deployment, not to the workspace's catalog."
+            )
+
+
+class _ObjectReader:
+    """Whole-object reads for one set of Iceberg properties, of the locations
+    `policy` admits."""
+
+    def __init__(self, properties: dict, policy):
         self._properties = properties
+        self.policy = policy
         self._checked: set = set()
 
     def read(self, location: str) -> bytes:
+        self.policy.check(location)
         protocol, path = _resolve(location)
         filesystem = _filesystem(protocol)
         if protocol not in self._checked:
@@ -218,13 +325,15 @@ def _catalog_io(protocol: str):
 
 class _ObjectWriter:
     """Writes, existence checks and deletes for one set of Iceberg properties,
-    refused under the same identity check as reads."""
+    refused under the same identity check and location policy as reads."""
 
-    def __init__(self, properties: dict):
+    def __init__(self, properties: dict, policy):
         self.properties = properties
+        self.policy = policy
         self._checked: set = set()
 
     def _target(self, location: str) -> tuple[str, str]:
+        self.policy.check(location)
         protocol, path = _resolve(location)
         if protocol != "file" and protocol not in self._checked:
             _check_identity(protocol, _filesystem(protocol), self.properties)
@@ -282,20 +391,34 @@ class OpteryxInputFile(PyIcebergInputFile):
 
 
 class OpteryxFileIO(PyIcebergFileIO):
-    """pyiceberg FileIO reading through opteryx-core (see module docstring)."""
+    """pyiceberg FileIO reading through opteryx-core (see module docstring), for
+    an operator's catalog: every location the reader supports."""
 
     def __init__(self, properties: dict | None = None):
         super().__init__(properties or {})
-        self._reader = _ObjectReader(dict(self.properties))
+        self.policy = self.new_policy()
+        self._reader = _ObjectReader(dict(self.properties), self.policy)
+
+    @staticmethod
+    def new_policy():
+        return AnyLocation()
 
     def new_input(self, location: str) -> OpteryxInputFile:
         return OpteryxInputFile(location, self._reader)
 
     def new_output(self, location: str) -> PyIcebergOutputFile:
-        return OpteryxOutputFile(location, _ObjectWriter(dict(self.properties)))
+        return OpteryxOutputFile(location, _ObjectWriter(dict(self.properties), self.policy))
 
     def delete(self, location: str) -> None:
-        _ObjectWriter(dict(self.properties)).delete(location)
+        _ObjectWriter(dict(self.properties), self.policy).delete(location)
+
+
+class TenantFileIO(OpteryxFileIO):
+    """OpteryxFileIO for a tenant's catalog: `TenantLocations` only."""
+
+    @staticmethod
+    def new_policy():
+        return TenantLocations()
 
 
 class _PyIcebergOutputStream:
@@ -335,7 +458,9 @@ class OpteryxOutputFile(PyIcebergOutputFile):
         return self._writer.exists(self.location)
 
     def to_input_file(self) -> OpteryxInputFile:
-        return OpteryxInputFile(self.location, _ObjectReader(self._writer.properties))
+        return OpteryxInputFile(
+            self.location, _ObjectReader(self._writer.properties, self._writer.policy)
+        )
 
     def create(self, overwrite: bool = False) -> _PyIcebergOutputStream:
         if not overwrite and self._writer.exists(self.location):
@@ -356,11 +481,12 @@ class IcebergInputFile(BaseInputFile):
 
 
 class IcebergFileIO(FileIO):
-    """opteryx_catalog's FileIO surface over the same whole-object reads."""
+    """opteryx_catalog's FileIO surface over the same whole-object reads, of the
+    locations `policy` admits (`AnyLocation` / `TenantLocations`)."""
 
-    def __init__(self, properties: dict | None = None):
-        self._reader = _ObjectReader(dict(properties or {}))
-        self._writer = _ObjectWriter(dict(properties or {}))
+    def __init__(self, properties: dict | None, policy):
+        self._reader = _ObjectReader(dict(properties or {}), policy)
+        self._writer = _ObjectWriter(dict(properties or {}), policy)
 
     def new_input(self, location: str) -> IcebergInputFile:
         return IcebergInputFile(location, self._reader)

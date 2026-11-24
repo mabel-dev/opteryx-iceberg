@@ -377,7 +377,7 @@ def _location(table) -> str:
 
 def open_data_file_writer(
     table,
-    properties: dict,
+    io,
     sorted_by=None,
     sorted_descending: bool = False,
     write_options: dict | None = None,
@@ -393,7 +393,7 @@ def open_data_file_writer(
     options = dict(WRITE_PARQUET_OPTIONS if write_options is None else write_options)
     options[PARQUET_FIELD_IDS_OPTION] = field_id_by_name
     return open_data_file_writer_at(
-        IcebergFileIO(properties),
+        IcebergFileIO(io.properties, io.policy),
         _location(table),
         field_id_by_name,
         sorted_by=sorted_by,
@@ -417,7 +417,7 @@ def _physical_by_field_id(table) -> dict:
     }
 
 
-def _parent_manifest_files(table, parent, properties: dict) -> dict:
+def _parent_manifest_files(table, parent, io) -> dict:
     """The parent snapshot's manifest-list rows, column by column, to carry over."""
     from rugo.avro import read_avro
 
@@ -426,7 +426,7 @@ def _parent_manifest_files(table, parent, properties: dict) -> dict:
     columns = {name: [] for name in MANIFEST_FILE_COLUMNS}
     if parent is None:
         return columns
-    data = _ObjectReader(properties).read(parent.manifest_list)
+    data = _ObjectReader(io.properties, io.policy).read(parent.manifest_list)
     with read_avro(data, columns=MANIFEST_FILE_COLUMNS, reader_schema=MANIFEST_FILE_SCHEMA, max_threads=1) as reader:
         for morsel in reader:
             for name in MANIFEST_FILE_COLUMNS:
@@ -452,9 +452,10 @@ def _summary(parent, files: int, records: int, size: int):
     return Summary(Operation.APPEND, **{key: str(value) for key, value in counters.items()})
 
 
-def append_files(table, properties: dict, manifest: bytes):
+def append_files(table, io, manifest: bytes):
     """Commit the engine's written files as one fast-append snapshot; returns
-    the table as the catalog holds it after the commit."""
+    the table as the catalog holds it after the commit. `io` is the dataset's
+    FileIO: its properties and its location policy govern every write."""
     from opteryx_catalog.catalog.manifest import read_manifest_rows
     from opteryx_catalog.exceptions import SnapshotRaceError
     from pyiceberg.exceptions import CommitFailedException
@@ -481,7 +482,7 @@ def append_files(table, properties: dict, manifest: bytes):
     snapshot_id = new_snapshot_id()
     sequence_number = metadata.last_sequence_number + 1
     physical = _physical_by_field_id(table)
-    writer = _ObjectWriter(properties)
+    writer = _ObjectWriter(io.properties, io.policy)
     token = uuid.uuid4()
 
     manifest_path = f"{location}/metadata/{token}-m0.avro"
@@ -504,7 +505,7 @@ def append_files(table, properties: dict, manifest: bytes):
         },
     )
 
-    carried = _parent_manifest_files(table, parent, properties)
+    carried = _parent_manifest_files(table, parent, io)
     added = {
         "manifest_path": manifest_path,
         "manifest_length": len(manifest_bytes),

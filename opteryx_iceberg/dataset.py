@@ -322,8 +322,10 @@ class IcebergDataset(Dataset):
     bounds_are_ordinal = True
 
     def __init__(self, identifier: str, table, io):
-        """`io` is the FileIO manifests are read through - always an
-        OpteryxFileIO, never `table.io` (see IcebergMetastore.load_dataset)."""
+        """`io` is the FileIO manifests are read through - always the
+        metastore's OpteryxFileIO / TenantFileIO, never `table.io` (see
+        IcebergMetastore.load_dataset). Its `policy` also decides which data
+        files may be handed to opteryx-core."""
         self.identifier = identifier
         self._table = table
         self._io = io
@@ -476,6 +478,10 @@ class IcebergDataset(Dataset):
                 ordinal_types[field.field_id] = column_type.physical
 
         for data_file in plan_data_files(self._io, snapshot, self.identifier, ordinal_types):
+            # Data files are read by opteryx-core's scan, not through `self._io`,
+            # so the location policy is applied to each one here - under the same
+            # identity, a manifest can name any file a metadata read could.
+            self._io.policy.check(data_file.file_path)
             yield {
                 "file_path": _reader_path(data_file.file_path),
                 "file_format": data_file.file_format,
@@ -508,7 +514,7 @@ class IcebergDataset(Dataset):
 
         return open_data_file_writer(
             self._table,
-            self._io.properties,
+            self._io,
             sorted_by=sorted_by,
             sorted_descending=sorted_descending,
             write_options=write_options,
@@ -537,7 +543,7 @@ class IcebergDataset(Dataset):
             )
         if index_files:
             raise NotImplementedError("Iceberg tables have no vector indexes to commit.")
-        self._table = append_files(self._table, self._io.properties, manifest)
+        self._table = append_files(self._table, self._io, manifest)
 
 
 def _reader_path(file_path: str) -> str:

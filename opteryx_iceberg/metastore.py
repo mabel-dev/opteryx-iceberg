@@ -32,9 +32,12 @@ from pyiceberg.table.refs import SnapshotRefType
 from pyiceberg.typedef import EMPTY_DICT
 
 from opteryx_iceberg.dataset import IcebergDataset
+from opteryx_iceberg.egress import harden
 from opteryx_iceberg.fileio import PY_IO_IMPL
+from opteryx_iceberg.fileio import TENANT_PY_IO_IMPL
 from opteryx_iceberg.fileio import IcebergFileIO
 from opteryx_iceberg.fileio import OpteryxFileIO
+from opteryx_iceberg.fileio import TenantFileIO
 
 # The catalog properties IcebergMetastore accepts - everything a workspace's
 # catalog binding can carry, decided from what the hosted product offers
@@ -142,9 +145,28 @@ class _GuardedRestCatalog(RestCatalog):
         # A table's FileIO is built from the catalog's properties under the table's
         # metadata properties and the load-table `config` - all of which the catalog's
         # owner writes - and pyiceberg imports and calls whatever `py-io-impl` that
-        # names. Iceberg metadata is read through OpteryxFileIO whatever is served
-        # (see IcebergMetastore.load_dataset), so it is fixed here too.
-        return super()._load_file_io({**properties, "py-io-impl": PY_IO_IMPL}, location)
+        # names. It is fixed to the catalog's OWN configured `py-io-impl` (OpteryxFileIO
+        # or TenantFileIO, set by IcebergMetastore), which `_fetch_config` already
+        # refuses a server changing - so what is served for a table cannot swap it.
+        return super()._load_file_io(
+            {**properties, "py-io-impl": self.properties["py-io-impl"]}, location
+        )
+
+
+class _TenantRestCatalog(_GuardedRestCatalog):
+    """`_GuardedRestCatalog` for a tenant's catalog: every session pyiceberg makes
+    reaches only public https addresses, pinned, with no redirects
+    (opteryx_iceberg.egress).
+
+    Hooked at `_config_headers` because it is the first thing pyiceberg's
+    `_create_session` does with a new session - before the /v1/config request
+    (`_fetch_config` builds its own session the same way) and before the legacy
+    OAuth2 manager fetches a token from `oauth2-server-uri` on that session.
+    """
+
+    def _config_headers(self, session) -> None:
+        harden(session)
+        super()._config_headers(session)
 
 
 class IcebergMetastore(Metastore):
@@ -161,6 +183,12 @@ class IcebergMetastore(Metastore):
     # is read from Iceberg. Declared explicitly rather than inherited - see
     # `Metastore.serves_catalog_records`.
     serves_catalog_records: bool = False
+
+    # The FileIO every Iceberg file is read and written through: a tenant's
+    # catalog may name only `TenantLocations` (opteryx_iceberg.fileio), because
+    # each of those locations is opened with Opteryx's own identity.
+    _file_io = TenantFileIO
+    _py_io_impl = TENANT_PY_IO_IMPL
 
     def __init__(
         self,
@@ -229,12 +257,17 @@ class IcebergMetastore(Metastore):
                 f"'py-io-impl' is not configurable (got {properties['py-io-impl']!r})."
             )
         self.workspace = workspace
-        iceberg_properties = {"py-io-impl": PY_IO_IMPL, **properties}
+        iceberg_properties = {"py-io-impl": self._py_io_impl, **properties}
         if catalog_type == "rest":
-            self._catalog = _GuardedRestCatalog(workspace, **iceberg_properties)
+            self._catalog = self._rest_catalog(workspace, iceberg_properties)
         else:
             self._catalog = load_catalog(workspace, type=catalog_type, **iceberg_properties)
-        self.io = IcebergFileIO(properties)
+        self.io = IcebergFileIO(properties, self._file_io.new_policy())
+
+    @staticmethod
+    def _rest_catalog(workspace: str, properties: dict):
+        # A tenant's address is reached only as a public https host (egress).
+        return _TenantRestCatalog(workspace, **properties)
 
     def load_dataset(self, identifier: str, load_history: bool = False) -> IcebergDataset:
         table = self._load_table(identifier)
@@ -246,7 +279,7 @@ class IcebergMetastore(Metastore):
         # and take manifest reads off opteryx-core. The merged properties are
         # still the right ones to check identity against, so they are kept and
         # only the implementation is fixed.
-        return IcebergDataset(identifier, table, OpteryxFileIO(table.io.properties))
+        return IcebergDataset(identifier, table, self._file_io(table.io.properties))
 
     def load_view(self, identifier: str):
         # No Iceberg view-spec support in Tier 1. Callers (e.g.
@@ -255,6 +288,10 @@ class IcebergMetastore(Metastore):
         raise NotImplementedError(
             "opteryx-iceberg (Tier 1) does not support Iceberg views."
         )
+
+    def property_graph_exists(self, identifier) -> bool:
+        # Property graphs are native-catalog objects; an Iceberg catalog holds none.
+        return False
 
     def get_relation(self, identifier: str):
         """Single-round-trip relation resolution used during query binding.
@@ -485,7 +522,16 @@ class UnrestrictedIcebergMetastore(IcebergMetastore):
     any pyiceberg property, including ones that load code or present ambient
     credentials. ONLY for configuration the deployment's operator writes (a
     self-hosted box's environment, a script, a test) - never for a binding a
-    workspace owner can edit. A REST catalog is still `_GuardedRestCatalog`."""
+    workspace owner can edit. A REST catalog is still `_GuardedRestCatalog`, and
+    its files may be at any location the reader supports (OpteryxFileIO)."""
+
+    _file_io = OpteryxFileIO
+    _py_io_impl = PY_IO_IMPL
+
+    @staticmethod
+    def _rest_catalog(workspace: str, properties: dict):
+        # An operator's catalog may be private (a local Lakekeeper, a VPC service).
+        return _GuardedRestCatalog(workspace, **properties)
 
     def __init__(
         self,

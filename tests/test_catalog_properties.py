@@ -55,7 +55,7 @@ TOKEN_EXFIL_BINDING = {
 def _captured(**binding):
     """What IcebergMetastore hands pyiceberg's REST catalog, without a network."""
     construct = MagicMock()
-    with patch("opteryx_iceberg.metastore._GuardedRestCatalog", construct):
+    with patch("opteryx_iceberg.metastore._TenantRestCatalog", construct):
         IcebergMetastore(workspace="ws", **binding)
     (name,), properties = construct.call_args
     return name, properties
@@ -178,7 +178,7 @@ def test_polaris_binding_with_a_stored_credential_reaches_pyiceberg_unchanged():
     name, properties = _captured(**binding)
     assert name == "ws"
     expected = {k: v for k, v in binding.items() if k != "catalog_type"}
-    assert properties == {"py-io-impl": "opteryx_iceberg.fileio.OpteryxFileIO", **expected}
+    assert properties == {"py-io-impl": "opteryx_iceberg.fileio.TenantFileIO", **expected}
 
 
 def test_biglake_binding_with_ambient_google_auth_reaches_pyiceberg_unchanged():
